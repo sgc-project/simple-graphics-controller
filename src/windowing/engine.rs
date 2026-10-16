@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use simple_graphics_protocol::Resource;
+use simple_graphics_protocol::{PlaneRole, Resource};
 use tokio::{
     sync::{mpsc, oneshot},
     time::{Instant, timeout_at},
@@ -288,7 +288,14 @@ async fn run_engine(mut rx: mpsc::Receiver<EngineCommand>, policies: HashMap<Res
 /// lease or the framebuffer: whoever owns one of these IS the seat, and there is
 /// exactly one seat (the daemon does not support several displays).
 fn is_display(resource: &Resource) -> bool {
-    matches!(resource, Resource::Drm { .. } | Resource::Fbdev)
+    match resource {
+        // The PRIMARY plane is the seat. An overlay plane is hardware
+        // compositing above whoever holds the display, so it is never the app
+        // on screen (it is refused outright today, see `handle_acquire`).
+        Resource::Drm { plane, .. } => *plane == PlaneRole::Primary,
+        Resource::Fbdev => true,
+        _ => false,
+    }
 }
 
 /// Does `client` hold the display? Input belongs to the app on screen (see

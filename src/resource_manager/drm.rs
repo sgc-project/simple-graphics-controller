@@ -1,5 +1,8 @@
 //! DRM backend: open display-capable cards (`/dev/dri/cardN`) as DRM master
-//! and register each as `Resource::Drm { card }`.
+//! and register each as `Resource::drm(card)` — the card's PRIMARY plane, the
+//! one an app on the display draws through. The overlay role of the same card
+//! is part of the protocol and refused here for now (see
+//! [`Resource::drm_overlay`] and `docs/resource-manager.md`).
 //!
 //! Compiled only with the `drm` feature (default). The master fd never
 //! leaves the server: every grant creates a FRESH lease over the card's
@@ -285,7 +288,7 @@ fn lease_objects(card: &DrmCard) -> io::Result<Vec<RawResourceHandle>> {
 }
 
 /// Open every DRM card that can present a display and register it as
-/// `Resource::Drm { card }` — each physical `/dev/dri/cardN` becomes one
+/// `Resource::drm(card)` — each physical `/dev/dri/cardN` becomes one
 /// resource, registered in priority order (first is best). Render nodes
 /// (`renderDNN`) are skipped — they cannot modeset.
 ///
@@ -372,7 +375,7 @@ pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>
             continue;
         }
 
-        let resource = Resource::Drm { card: opened.index };
+        let resource = Resource::drm(opened.index);
         let fd = opened.card.as_raw_fd();
         info!("Opened {path} ({resource:?}) (master fd {fd})");
         inventory.drm.insert(

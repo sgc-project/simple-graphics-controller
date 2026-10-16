@@ -12,7 +12,9 @@ use crate::{
 };
 use nix::libc::pid_t;
 use sendfd::SendWithFd;
-use simple_graphics_protocol::{ClientRequest, Resource, ServerMessage, serialize_framed};
+use simple_graphics_protocol::{
+    ClientRequest, PlaneRole, Resource, ServerMessage, serialize_framed,
+};
 use tokio::{io::AsyncWriteExt, net::UnixStream, time::Instant};
 use tracing::{debug, info, warn};
 
@@ -66,6 +68,25 @@ pub(super) async fn handle_acquire(
     ack_deadline: &mut Option<Instant>,
 ) -> ServerResult<()> {
     info!("[client {client_id} (pid {client_pid})] Acquire: {resource:?}");
+
+    // The overlay role is part of the protocol but not of what this server
+    // grants yet: a lease over primary planes only has no overlay in it to hand
+    // over. Refuse it here, before the policy engine — an overlay must never
+    // queue for, or preempt, the app on the display.
+    if let Resource::Drm {
+        card,
+        plane: PlaneRole::Overlay,
+    } = resource
+    {
+        let reason = format!(
+            "overlay planes are not granted yet (card {card}: this server leases the primary \
+             plane only)"
+        );
+        warn!("[client {client_id} (pid {client_pid})] Denied {resource:?}: {reason}");
+        let resp = serialize_framed(&ServerMessage::Deny { reason })?;
+        stream.write_all(&resp).await.map_err(ServerError::Write)?;
+        return Ok(());
+    }
 
     match engine.acquire(client_id, resource.clone()).await {
         AcquireOutcome::Granted => {

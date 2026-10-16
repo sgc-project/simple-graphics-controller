@@ -19,11 +19,26 @@ no module, no dependency, no `/dev` probing.
 | feature | module                    | dependency         | device              | registers                    |
 | ------- | ------------------------- | ------------------ | ------------------- | ---------------------------- |
 | `fbdev` | `resource_manager::fbdev` | -                  | `/dev/fb0`          | `Resource::Fbdev` in fds     |
-| `drm`   | `resource_manager::drm`   | `drm` (optional)   | `/dev/dri/cardN`    | `Resource::Drm { card }` in drm registry |
+| `drm`   | `resource_manager::drm`   | `drm` (optional)   | `/dev/dri/cardN`    | `Resource::drm(card)` — the card's primary plane — in drm registry |
 | `input` | `resource_manager::input` | `evdev` (optional) | `/dev/input/event*` | `Resource::Input(_)` in fds |
 
 Default features: **`drm` + `input`**. `fbdev` is opt-in (legacy path kept
 for boards without DRM).
+
+### The plane a request names
+
+A card is offered per plane role (`simple_graphics_protocol::PlaneRole`).
+`Resource::drm(card)` is the card's **primary** plane, the one an app on the
+display scans out through; `Resource::drm_overlay(card)` is an overlay plane of
+the same pipeline, for hardware compositing above whoever holds the primary.
+
+Only the primary is granted today. The lease this server creates carries each
+CRTC, its display connectors and its primary plane — overlay and cursor planes
+stay with the server — so there is no overlay in it to hand over. An overlay
+acquire is logged and denied with a reason, before the policy engine: a guest
+plane must never queue for, or preempt, the app on the display. The role lives
+in the protocol already so a later grant can grow into it without changing the
+shape of a request.
 
 ```toml
 [features]

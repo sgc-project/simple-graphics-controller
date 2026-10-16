@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use simple_graphics_protocol::Resource;
+use simple_graphics_protocol::{PlaneRole, Resource};
 
 use crate::types::ResourceRegistry;
 // as above: only the consistency checker (and its tests) name this type
@@ -92,20 +92,31 @@ impl Inventory {
         }
     }
 
-    /// The fd to grant for one resource: a fresh lease for `Drm`, otherwise a
-    /// dup of the registered fd.
+    /// The fd to grant for one resource: a fresh lease for a card's PRIMARY
+    /// plane, otherwise a dup of the registered fd.
+    ///
+    /// The overlay role of a card is not granted yet: the lease this server
+    /// creates carries the primary planes only, so there is nothing to hand a
+    /// client that asks for an overlay. The request is refused (see
+    /// `handle_acquire`, which logs and denies before it gets here) and this
+    /// arm is what makes the refusal total.
     pub fn grant_fd(&self, resource: &Resource) -> anyhow::Result<OwnedFd> {
         match resource {
             #[cfg(feature = "drm")]
-            Resource::Drm { .. } => {
-                let device = self
-                    .drm
-                    .get(resource)
-                    .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?;
-                device
-                    .grant_lease()
-                    .map_err(|e| anyhow::anyhow!("failed to lease {resource:?}: {e}"))
-            }
+            Resource::Drm { card, plane } => match plane {
+                PlaneRole::Primary => {
+                    let device = self.drm.get(resource).ok_or_else(|| {
+                        anyhow::anyhow!("resource {resource:?} is not registered")
+                    })?;
+                    device
+                        .grant_lease()
+                        .map_err(|e| anyhow::anyhow!("failed to lease {resource:?}: {e}"))
+                }
+                PlaneRole::Overlay => Err(anyhow::anyhow!(
+                    "overlay planes are not granted yet (card {card}: this server leases the \
+                     primary plane only)"
+                )),
+            },
             _ => self
                 .fds
                 .get(resource)
@@ -119,8 +130,13 @@ impl Inventory {
     /// whatever the client does with the fd it was handed.
     pub fn revoke_lease(&self, resource: &Resource) {
         #[cfg(feature = "drm")]
-        if matches!(resource, Resource::Drm { .. })
-            && let Some(device) = self.drm.get(resource)
+        if matches!(
+            resource,
+            Resource::Drm {
+                plane: PlaneRole::Primary,
+                ..
+            }
+        ) && let Some(device) = self.drm.get(resource)
         {
             device.revoke_lease();
         }
