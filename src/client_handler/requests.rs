@@ -50,6 +50,20 @@ pub(super) async fn dispatch_request(
         ClientRequest::Release { resource } => {
             handle_release(client_id, resource, engine, inventory).await;
         }
+        ClientRequest::OverlayGeometry { resource, geometry } => {
+            // Client-reported placement: recorded, not acted on. An overlay
+            // that hides says so here and keeps its grant.
+            if let Resource::Drm { .. } = resource {
+                if let Some(device) = inventory.drm_device(&resource) {
+                    device.record_overlay_geometry(client_id, &resource, geometry);
+                }
+            } else {
+                debug!(
+                    "[client {client_id} (pid {client_pid})] geometry for a non-DRM \
+                     resource {resource:?} ignored"
+                );
+            }
+        }
         ClientRequest::Ack => {
             info!("[client {client_id} (pid {client_pid})] Grant acknowledged");
             *ack_deadline = None;

@@ -177,7 +177,7 @@ impl Inventory {
     /// it resolves through the card rather than by its own key, which is how a
     /// lookup by the overlay's own resource would find nothing.
     #[cfg(feature = "drm")]
-    fn drm_device(
+    pub(crate) fn drm_device(
         &self,
         resource: &Resource,
     ) -> Option<dashmap::mapref::one::Ref<'_, Resource, drm::DrmDevice>> {

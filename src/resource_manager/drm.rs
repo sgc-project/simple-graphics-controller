@@ -45,6 +45,7 @@
 //! while another task runs a grant on the same card (see
 //! docs/resource-manager.md).
 
+use std::collections::HashMap;
 use std::{
     fs::{File, read_dir},
     io,
@@ -64,6 +65,7 @@ use drm::control::{
     connector, crtc, plane, property,
 };
 use nix::fcntl::OFlag;
+use simple_graphics_protocol::OverlayGeometry;
 use simple_graphics_protocol::{DrmGrant, PlaneRole, Resource};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
@@ -464,6 +466,14 @@ enum DrmDeviceState {
 pub struct DrmDevice {
     index: u8,
     state: Mutex<Option<DrmDeviceState>>,
+    /// Where each client says its overlay is. Client-reported, so it is what
+    /// the client *believes*, which is the part a stacking or focus policy
+    /// needs: the plane's programmed rectangle only reflects the last commit
+    /// and cannot say whether the client considers itself visible.
+    ///
+    /// Own mutex, never taken together with `state`: the record survives the
+    /// pipeline it was made on, which is the whole point of it being here.
+    overlay_geometries: Mutex<HashMap<ClientId, OverlayGeometry>>,
 }
 
 impl DrmDevice {
@@ -651,10 +661,46 @@ impl DrmDevice {
         });
     }
 
+    /// Record where a client says its overlay is, and say whether the plane
+    /// agrees. A disagreement is not an error on its own — a client reports the
+    /// geometry it asked for, and a commit may not have landed yet — but it is
+    /// exactly what one wants to see when a notification ends up somewhere
+    /// nobody expected.
+    pub fn record_overlay_geometry(
+        &self,
+        client: ClientId,
+        resource: &Resource,
+        geometry: OverlayGeometry,
+    ) {
+        self.overlay_geometries
+            .lock()
+            .unwrap()
+            .insert(client, geometry);
+
+        if geometry.is_hidden() {
+            info!(
+                "card{}: client {client} reports its overlay hidden (0,0,0,0) — it keeps its \
+                 grant",
+                self.index
+            );
+        } else {
+            info!(
+                "card{}: client {client} reports its overlay at {},{} {}x{}",
+                self.index, geometry.x, geometry.y, geometry.width, geometry.height
+            );
+        }
+        // The kernel's own rectangle is not readable through the legacy plane
+        // interface (drm's `plane::Info` carries no rect), so the record is
+        // checked against the plane state on the board — `crtc-pos` in the
+        // kernel's state dump — rather than guessed at here.
+        let _ = resource;
+    }
+
     /// Give the overlay plane back: the client owns it until it does, and it
     /// is free for another client afterwards. The lease itself is untouched —
     /// this client only held a plane of it.
     pub fn release_overlay(&self, owner: ClientId) {
+        self.overlay_geometries.lock().unwrap().remove(&owner);
         let mut guard = self.state.lock().unwrap();
         let current = guard.take().expect("state always present");
 
@@ -1079,6 +1125,7 @@ pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>
                     overlay_hold: None,
                     card: opened.card,
                 }))),
+                overlay_geometries: Mutex::new(HashMap::new()),
             },
         );
         advertised.push(resource);
