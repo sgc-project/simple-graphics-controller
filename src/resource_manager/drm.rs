@@ -71,6 +71,7 @@ use simple_graphics_protocol::{DrmGrant, PlaneRole, Resource};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::resource_manager::cursor::CursorSurface;
 use crate::resource_manager::overlay_policy::{
     self, OverlayClaim, OverlayDecision, OverlayGrantView, OverlayPolicy,
 };
@@ -495,6 +496,8 @@ pub struct DrmDevice {
     overlay_geometries: Mutex<HashMap<ClientId, OverlayGeometry>>,
     /// What the app on the display last asked the cursor to look like.
     cursor_request: Mutex<Option<CursorRequest>>,
+    /// The surface the controller draws the pointer on, once a pipeline exists.
+    cursor_surface: Mutex<Option<CursorSurface>>,
 }
 
 impl DrmDevice {
@@ -712,6 +715,63 @@ impl DrmDevice {
     /// The last cursor request accepted for this card, if any.
     pub(crate) fn cursor_request(&self) -> Option<CursorRequest> {
         *self.cursor_request.lock().unwrap()
+    }
+
+    /// What the display owner asked the cursor to look like, if it asked.
+    pub fn cursor_shape(&self) -> Option<CursorRequest> {
+        *self.cursor_request.lock().unwrap()
+    }
+
+    /// The mode of the pipeline this card is driving, if it is driving one.
+    /// The pointer is clamped to it: the kernel refuses a cursor at the edge,
+    /// so a stale mode is a cursor that vanishes in a corner.
+    pub fn pipeline_mode(&self) -> Option<(u32, u32)> {
+        let guard = self.state.lock().unwrap();
+        let DrmDeviceState::Leased(dev) = guard.as_ref().expect("state always present") else {
+            return None;
+        };
+        let (crtc, _) = live_pipeline(&dev.card)?;
+        let mode = dev.card.get_crtc(crtc).ok()?.mode()?;
+        Some((mode.size().0 as u32, mode.size().1 as u32))
+    }
+
+    /// Draw the pointer at `position` with `shape`, on this card's pipeline.
+    ///
+    /// No pipeline means no cursor: there is nothing on screen to point at, and
+    /// a plane commit on a CRTC with no mode would be refused anyway.
+    pub fn show_cursor(&self, shape: CursorShape, position: (i32, i32)) {
+        // Lock order: the card state, then the cursor surface. Never the other
+        // way round.
+        let state = self.state.lock().unwrap();
+        let DrmDeviceState::Leased(dev) = state.as_ref().expect("state always present") else {
+            return;
+        };
+        let Some((crtc, _)) = live_pipeline(&dev.card) else {
+            return;
+        };
+        let mut guard = self.cursor_surface.lock().unwrap();
+        let surface = guard.get_or_insert_with(|| CursorSurface::new(crtc));
+        if let Err(e) = surface.show_at(&dev.card, shape, position) {
+            warn!(
+                "card{}: could not draw the cursor at {position:?}: {e}",
+                self.index
+            );
+        }
+    }
+
+    /// Take the pointer off screen (no pipeline, or the app hid it).
+    pub fn hide_cursor(&self) {
+        let state = self.state.lock().unwrap();
+        let card = match state.as_ref().expect("state always present") {
+            DrmDeviceState::Leased(dev) => &dev.card,
+            DrmDeviceState::Locked(dev) => &dev.card,
+        };
+        let mut guard = self.cursor_surface.lock().unwrap();
+        if let Some(surface) = guard.as_mut()
+            && let Err(e) = surface.hide(card)
+        {
+            warn!("card{}: could not hide the cursor: {e}", self.index);
+        }
     }
 
     /// Record where a client says its overlay is, and say whether the plane
@@ -1232,6 +1292,7 @@ pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>
                 }))),
                 overlay_geometries: Mutex::new(HashMap::new()),
                 cursor_request: Mutex::new(None),
+                cursor_surface: Mutex::new(None),
             },
         );
         advertised.push(resource);

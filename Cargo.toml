@@ -21,7 +21,7 @@ input = ["dep:evdev"]
 # wins locally, so bump the version here when the protocol changes.
 simple-graphics-protocol = { version = "0.1", path = "../simple-graphics-protocol" }
 tokio = { version = "1", features = ["full"] }
-nix = { version = "0.29", features = ["fs", "socket", "uio", "inotify"] }
+nix = { version = "0.29", features = ["fs", "socket", "uio", "inotify", "poll"] }
 sendfd = { version = "0.4.4", features = ["tokio"] }
 dashmap = "6.2.1"
 tracing = "0.1"

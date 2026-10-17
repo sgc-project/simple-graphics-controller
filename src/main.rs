@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 #[cfg(feature = "input")]
 use crate::resource_manager::hotplug;
 use crate::{
-    resource_manager::open_resources,
+    resource_manager::{open_resources, spawn_pointer_tracking},
     types::AdvertisedResources,
     windowing::{Policy, PolicyEngine},
 };
@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting simple-graphics-controller");
     let (inventory, advertised) = open_resources();
+    spawn_pointer_tracking(inventory.drm_registry());
 
     info!("{}", resource_manager::cursor_art_summary());
     // Advertised list: shared and mutable, because the input reconciler adds

@@ -22,7 +22,8 @@ mod cursor_art {
     //! hotspot per shape — are documented there.
     include!(concat!(env!("OUT_DIR"), "/cursor_art.rs"));
 }
-pub(crate) mod drm;
+pub(crate) mod cursor;
+mod drm;
 #[cfg(feature = "fbdev")]
 mod fbdev;
 #[cfg(feature = "input")]
@@ -30,6 +31,7 @@ pub mod hotplug;
 #[cfg(feature = "input")]
 mod input;
 mod overlay_policy;
+mod pointer;
 
 // Both are only used by the debug/test-only consistency checker below: a release
 // build does not compile it, and then has no use for them.
@@ -513,5 +515,105 @@ mod tests {
                 .any(|p| p.contains("device_gone but still has an fd")),
             "{problems:?}"
         );
+    }
+}
+
+/// Read the input devices for the controller's own pointer tracking, and draw
+/// the cursor where they take it.
+///
+/// The controller opens the devices itself, and reads **its own** descriptors —
+/// never the ones it hands to clients. `SCM_RIGHTS` shares a file description,
+/// not just a descriptor, so a reader here and a reader in the client on the
+/// same description would each get part of the event stream: a pointer that
+/// jumps under load, with no error anywhere. Two independent `open()` calls
+/// give two descriptions, and both see every event.
+///
+/// Only devices with relative axes are read (a pointer, not a keyboard), and
+/// the set is rediscovered every second so a device plugged in later is picked
+/// up and an unplugged one is dropped. Absolute devices are out of scope until
+/// the projection work gives them an axis range to map.
+pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry) {
+    use std::collections::HashMap;
+    use std::os::fd::AsRawFd;
+
+    std::thread::spawn(move || {
+        let mut pointer = pointer::Pointer::new((0, 0));
+        let mut devices: HashMap<std::path::PathBuf, evdev::Device> = HashMap::new();
+        let mut last_discovery = std::time::Instant::now();
+        // The mode the cursor was last drawn on. A new pipeline (the first
+        // client, a resume) draws the cursor at once instead of waiting for the
+        // user to move the mouse: an invisible cursor on a fresh screen looks
+        // like the cursor is broken.
+        let mut drawn_on: Option<(u32, u32)> = None;
+
+        loop {
+            if last_discovery.elapsed() >= std::time::Duration::from_secs(1) {
+                last_discovery = std::time::Instant::now();
+                for (path, device) in evdev::enumerate() {
+                    if device.supported_relative_axes().iter().next().is_some() {
+                        // `or_insert`: a device already being read keeps its
+                        // position in the queue; a new one starts here.
+                        devices.entry(path).or_insert(device);
+                    }
+                }
+                devices.retain(|path, _| path.exists());
+            }
+
+            // Wake at least once a second: the rediscovery above must run even
+            // when nothing moves.
+            let mut fds: Vec<nix::poll::PollFd> = devices
+                .values()
+                .map(|device| {
+                    // SAFETY: the descriptor belongs to `device`, which outlives
+                    // this borrow: the BorrowedFd is only used for this poll.
+                    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(device.as_raw_fd()) };
+                    nix::poll::PollFd::new(fd, nix::poll::PollFlags::POLLIN)
+                })
+                .collect();
+            let _ = nix::poll::poll(&mut fds, 1000u16);
+
+            let mut moved = false;
+            for device in devices.values_mut() {
+                let Ok(events) = device.fetch_events() else {
+                    continue;
+                };
+                for event in events {
+                    if pointer.handle(event.event_type(), event.code(), event.value()) {
+                        moved = true;
+                    }
+                }
+            }
+            // The clamp belongs to the display, which belongs to a card.
+            let mut mode = None;
+            for card in drm.iter() {
+                mode = card.pipeline_mode().or(mode);
+            }
+            let Some(mode) = mode else {
+                continue;
+            };
+            let fresh_pipeline = drawn_on != Some(mode);
+            if !moved && !fresh_pipeline {
+                continue;
+            }
+            pointer.set_mode(mode);
+            drawn_on = Some(mode);
+            let position = pointer.position();
+            for card in drm.iter() {
+                match card.cursor_shape() {
+                    Some(request) if !request.visible => card.hide_cursor(),
+                    Some(request) => card.show_cursor(request.shape, position),
+                    None => {
+                        card.show_cursor(simple_graphics_protocol::CursorShape::Default, position)
+                    }
+                }
+            }
+        }
+    });
+}
+
+impl Inventory {
+    /// The cards, for the pointer reader (which outlives any one request).
+    pub fn drm_registry(&self) -> DrmRegistry {
+        self.drm.clone()
     }
 }
