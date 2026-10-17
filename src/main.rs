@@ -36,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting simple-graphics-controller");
     let (inventory, advertised) = open_resources();
+
+    info!("{}", resource_manager::cursor_art_summary());
     // Advertised list: shared and mutable, because the input reconciler adds
     // and drops resources as devices come and go.
     let advertised = Arc::new(AdvertisedResources::new(advertised));

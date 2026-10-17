@@ -13,7 +13,16 @@
 //! match (the first DRM card is the display card).
 
 #[cfg(feature = "drm")]
-mod drm;
+mod cursor_art {
+    //! The controller's cursor artwork, generated at build time.
+    //!
+    //! Produced by `tools/gen_cursors.py` into `OUT_DIR` (from `cursor-icons/*.png`
+    //! when that directory exists, otherwise from the drawn set). The rules the
+    //! generator enforces — opaque or transparent pixels only, a baked outline, a
+    //! hotspot per shape — are documented there.
+    include!(concat!(env!("OUT_DIR"), "/cursor_art.rs"));
+}
+pub(crate) mod drm;
 #[cfg(feature = "fbdev")]
 mod fbdev;
 #[cfg(feature = "input")]
@@ -32,7 +41,7 @@ use std::sync::Arc;
 
 use crate::types::ClientId;
 use dashmap::DashMap;
-use simple_graphics_protocol::{DrmGrant, PlaneRole, Resource};
+use simple_graphics_protocol::{CursorShape, DrmGrant, PlaneRole, Resource};
 
 use crate::types::ResourceRegistry;
 // as above: only the consistency checker (and its tests) name this type
@@ -177,6 +186,28 @@ impl Inventory {
     /// it resolves through the card rather than by its own key, which is how a
     /// lookup by the overlay's own resource would find nothing.
     #[cfg(feature = "drm")]
+    /// The card whose pipeline `client` holds, if any. A cursor request names no
+    /// card (there is one pointer), so the daemon finds the lease behind it.
+    /// Record the cursor shape for whichever card `client` holds the lease of.
+    ///
+    /// A cursor request names no card — there is one pointer — so the daemon
+    /// finds the lease behind it. Returns whether any card accepted it (i.e.
+    /// whether the client is a display owner at all).
+    pub(crate) fn record_cursor_shape(
+        &self,
+        client: ClientId,
+        shape: CursorShape,
+        visible: bool,
+    ) -> Option<drm::CursorRequest> {
+        for entry in self.drm.iter() {
+            let device = entry.value();
+            if device.record_cursor_shape(client, shape, visible) {
+                return device.cursor_request();
+            }
+        }
+        None
+    }
+
     pub(crate) fn drm_device(
         &self,
         resource: &Resource,
@@ -233,6 +264,52 @@ impl Inventory {
 /// Returns the devices the daemon holds, plus the resources in advertised order
 /// (priority order — first is best). Backends that are not compiled in
 /// contribute nothing.
+/// The artwork for `shape`, in the size this build carries.
+///
+/// A shape the artwork does not carry falls back to the default pointer: a
+/// wrong-shaped cursor is a visible bug, a missing one a usability bug, and the
+/// second is worse.
+pub(crate) fn cursor_art(shape: CursorShape) -> &'static cursor_art::Art {
+    use CursorShape::*;
+    match shape {
+        Default => &cursor_art::DEFAULT,
+        Text => &cursor_art::TEXT,
+        Pointer => &cursor_art::POINTER,
+        Crosshair => &cursor_art::CROSSHAIR,
+        Move => &cursor_art::MOVE,
+        ResizeVertical => &cursor_art::RESIZE_VERTICAL,
+        ResizeHorizontal => &cursor_art::RESIZE_HORIZONTAL,
+        ResizeTopLeft => &cursor_art::RESIZE_TOP_LEFT,
+        ResizeTopRight => &cursor_art::RESIZE_TOP_RIGHT,
+        Wait => &cursor_art::WAIT,
+        Progress => &cursor_art::PROGRESS,
+        NotAllowed => &cursor_art::NOT_ALLOWED,
+        Help => &cursor_art::HELP,
+        Grab => &cursor_art::GRAB,
+        Grabbing => &cursor_art::GRABBING,
+    }
+}
+
+/// One line describing the cursor artwork this build carries, for the startup
+/// log — an operator should see what the pointer can look like without digging
+/// into the build directory.
+pub(crate) fn cursor_art_summary() -> String {
+    let names: Vec<&str> = cursor_art::ALL.iter().map(|(name, _)| *name).collect();
+    // The default pointer is the one an app gets before it asks for anything,
+    // so its size and hotspot are what the startup line should state.
+    let default = cursor_art(CursorShape::Default);
+    format!(
+        "{} cursor shapes, {} px each: {} (default {}x{}, hotspot {},{})",
+        names.len(),
+        default.pixels.len(),
+        names.join(", "),
+        default.width,
+        default.height,
+        default.hotspot.0,
+        default.hotspot.1
+    )
+}
+
 pub fn open_resources() -> (Inventory, Vec<Resource>) {
     let resource_reg: ResourceRegistry = Arc::new(DashMap::new());
     // With no backend features the list is never pushed to; the mut keeps

@@ -50,6 +50,25 @@ pub(super) async fn dispatch_request(
         ClientRequest::Release { resource } => {
             handle_release(client_id, resource, engine, inventory).await;
         }
+        ClientRequest::CursorShape { shape, visible } => {
+            // Only the app on the display picks the pointer's shape: a
+            // background window must not change what the user is looking at.
+            // The controller draws it, so this is a request for the art and the
+            // visibility, not a claim on the cursor.
+            match inventory.record_cursor_shape(client_id, shape, visible) {
+                // Recorded, not drawn yet: the renderer (pointer tracking plus
+                // the plane commit) lands next. The log must not claim more.
+                Some(request) => debug!(
+                    "[client {client_id} (pid {client_pid})] cursor: client {} wants {:?} \
+                     (visible {}) — recorded",
+                    request.client, request.shape, request.visible
+                ),
+                None => debug!(
+                    "[client {client_id} (pid {client_pid})] cursor shape ignored: not the \
+                     display's owner"
+                ),
+            }
+        }
         ClientRequest::OverlayGeometry { resource, geometry } => {
             // Client-reported placement: recorded, not acted on. An overlay
             // that hides says so here and keeps its grant.

@@ -65,6 +65,7 @@ use drm::control::{
     connector, crtc, plane, property,
 };
 use nix::fcntl::OFlag;
+use simple_graphics_protocol::CursorShape;
 use simple_graphics_protocol::OverlayGeometry;
 use simple_graphics_protocol::{DrmGrant, PlaneRole, Resource};
 use thiserror::Error;
@@ -178,6 +179,15 @@ pub struct LockedDrmDevice {
     /// This is why an overlay does not have to ask again: it never lost its
     /// grant, only the plane under it.
     overlay_hold: Option<ClientId>,
+}
+
+/// The shape the app on the display wants the pointer to take.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CursorRequest {
+    /// The client that asked — the lease owner at the time.
+    pub client: ClientId,
+    pub shape: CursorShape,
+    pub visible: bool,
 }
 
 /// What a lease grant hands back: the client's fd, and the client (if any)
@@ -340,12 +350,21 @@ impl LeasedDrmDevice {
             .map(|(plane, _)| plane)
             .ok_or_else(|| OverlayError::NoFreePlane(index, u32::from(crtc)))?;
 
-        if let Err(e) = raise_plane_above_primary(&self.card, plane) {
-            warn!(
-                "card{index}: could not raise overlay plane {} above the primary: {e} — it may \
-                 be occluded by the client on it",
+        match raise_plane_above_primary(&self.card, plane) {
+            ZposOutcome::AlreadyAbove { overlay, primary } => info!(
+                "card{index}: overlay plane {} is above the primary (zpos {overlay} vs \
+                 {primary})",
                 u32::from(plane)
-            );
+            ),
+            ZposOutcome::Raised { from, to, primary } => info!(
+                "card{index}: overlay plane {} raised above the primary (zpos {from} -> {to}, \
+                 primary {primary})",
+                u32::from(plane)
+            ),
+            ZposOutcome::CannotRaise { reason } => warn!(
+                "card{index}: overlay plane {} may be HIDDEN behind the primary: {reason}",
+                u32::from(plane)
+            ),
         }
 
         let grant = OverlayGrant {
@@ -474,6 +493,8 @@ pub struct DrmDevice {
     /// Own mutex, never taken together with `state`: the record survives the
     /// pipeline it was made on, which is the whole point of it being here.
     overlay_geometries: Mutex<HashMap<ClientId, OverlayGeometry>>,
+    /// What the app on the display last asked the cursor to look like.
+    cursor_request: Mutex<Option<CursorRequest>>,
 }
 
 impl DrmDevice {
@@ -659,6 +680,38 @@ impl DrmDevice {
             }
             other => other,
         });
+    }
+
+    /// Remember the shape the app on the display asked for. Only the client
+    /// holding the lease may set it: a background window must not change the
+    /// pointer the user is looking at.
+    ///
+    /// Returns whether the request was accepted, so the caller can log a
+    /// refusal instead of pretending the shape changed.
+    pub fn record_cursor_shape(&self, client: ClientId, shape: CursorShape, visible: bool) -> bool {
+        if !self.is_leased_by(client) {
+            return false;
+        }
+        *self.cursor_request.lock().unwrap() = Some(CursorRequest {
+            client,
+            shape,
+            visible,
+        });
+        true
+    }
+
+    /// Whether `client` holds this card's pipeline lease.
+    pub fn is_leased_by(&self, client: ClientId) -> bool {
+        let guard = self.state.lock().unwrap();
+        matches!(
+            guard.as_ref().expect("state always present"),
+            DrmDeviceState::Leased(dev) if dev.owner == client
+        )
+    }
+
+    /// The last cursor request accepted for this card, if any.
+    pub(crate) fn cursor_request(&self) -> Option<CursorRequest> {
+        *self.cursor_request.lock().unwrap()
     }
 
     /// Record where a client says its overlay is, and say whether the plane
@@ -888,21 +941,59 @@ fn stacking_plan(overlay: (u64, (u64, u64)), primary: (u64, (u64, u64))) -> Opti
 /// Program the z-order so `granted` sits above the primary. Best effort: a
 /// failure only means the plane may be occluded, and the grant is worth having
 /// either way.
-fn raise_plane_above_primary(card: &DrmCard, granted: plane::Handle) -> io::Result<()> {
-    let Some(primary) = primary_plane(card)? else {
-        return Ok(());
+/// What happened when the daemon tried to put a granted overlay above the
+/// primary plane.
+///
+/// The client cannot see z-order: it draws into a plane and the compositor
+/// decides what is on top. So this outcome is the only place the truth exists,
+/// and silence is how an overlay ends up granted, drawing, and invisible behind
+/// the app on the display — which is the failure mode on boards that stack
+/// overlays below the primary (Qualcomm among them).
+#[derive(Debug)]
+pub(super) enum ZposOutcome {
+    /// Already above: nothing was committed, because touching either plane
+    /// would only risk a modeset for no visible change.
+    AlreadyAbove { overlay: u64, primary: u64 },
+    /// A commit was made and the kernel now holds `to` — read back after the
+    /// commit, not assumed from the request.
+    Raised { from: u64, to: u64, primary: u64 },
+    /// The plane cannot be put above the primary here, and why.
+    CannotRaise { reason: String },
+}
+
+fn raise_plane_above_primary(card: &DrmCard, granted: plane::Handle) -> ZposOutcome {
+    let Some(primary) = primary_plane(card).ok().flatten() else {
+        return ZposOutcome::CannotRaise {
+            reason: "the card reports no primary plane".to_string(),
+        };
     };
     let Some((overlay_prop, overlay_zpos, overlay_range)) = zpos(card, granted) else {
-        debug!("card{}: no zpos property, nothing to raise", card.index);
-        return Ok(());
+        return ZposOutcome::CannotRaise {
+            reason: "the driver exposes no zpos property".to_string(),
+        };
     };
     let Some((primary_prop, primary_zpos, primary_range)) = zpos(card, primary) else {
-        return Ok(());
+        return ZposOutcome::CannotRaise {
+            reason: "the primary plane has no zpos property".to_string(),
+        };
     };
+
+    if overlay_zpos > primary_zpos {
+        return ZposOutcome::AlreadyAbove {
+            overlay: overlay_zpos,
+            primary: primary_zpos,
+        };
+    }
 
     let Some(plan) = stacking_plan((overlay_zpos, overlay_range), (primary_zpos, primary_range))
     else {
-        return Ok(());
+        return ZposOutcome::CannotRaise {
+            reason: format!(
+                "no z-order above the primary is available (overlay zpos {overlay_zpos} in \
+                 {}..={}, primary zpos {primary_zpos} in {}..={})",
+                overlay_range.0, overlay_range.1, primary_range.0, primary_range.1
+            ),
+        };
     };
 
     let mut request = AtomicModeReq::new();
@@ -918,17 +1009,31 @@ fn raise_plane_above_primary(card: &DrmCard, granted: plane::Handle) -> io::Resu
     // ALLOW_MODESET because a z-order change is a modeset-shaped change on some
     // drivers; sun4i accepts it without, and vc4 does not offer it at all
     // (immutable zpos), which the plan above already accounts for.
-    card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, request)?;
-    info!(
-        "card{}: overlay plane {} zpos {overlay_zpos} -> {} (primary zpos {primary_zpos}{})",
-        card.index,
-        u32::from(granted),
-        plan.overlay,
-        plan.primary
-            .map(|value| format!(" -> {value}"))
-            .unwrap_or_default()
-    );
-    Ok(())
+    if let Err(e) = card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, request) {
+        return ZposOutcome::CannotRaise {
+            reason: format!("the z-order commit failed: {e}"),
+        };
+    }
+
+    // Read it back: the log has to state what the kernel holds, not what was
+    // asked for. A driver that accepts the commit and keeps its own order is
+    // exactly the case that hides an overlay.
+    match zpos(card, granted).map(|(_, value, _)| value) {
+        Some(after) if after > primary_zpos => ZposOutcome::Raised {
+            from: overlay_zpos,
+            to: after,
+            primary: primary_zpos,
+        },
+        Some(after) => ZposOutcome::CannotRaise {
+            reason: format!(
+                "the commit landed but the kernel still reports zpos {after} against the \
+                 primary's {primary_zpos}"
+            ),
+        },
+        None => ZposOutcome::CannotRaise {
+            reason: "the zpos property disappeared after the commit".to_string(),
+        },
+    }
 }
 
 /// Program a plane off the pipeline. A dropped grant is not a cleared plane:
@@ -1126,6 +1231,7 @@ pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>
                     card: opened.card,
                 }))),
                 overlay_geometries: Mutex::new(HashMap::new()),
+                cursor_request: Mutex::new(None),
             },
         );
         advertised.push(resource);
