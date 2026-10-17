@@ -102,6 +102,14 @@ impl Slot {
 
 /// Commands from connection tasks to the engine.
 enum EngineCommand {
+    /// Write an ordinary `Grant` for `resource` to `client`: how a client that
+    /// kept a claim across a pipeline change is told it has the plane of the
+    /// new pipeline. Deliberately not a special message — the client's normal
+    /// grant path has to handle it.
+    GrantTo {
+        client: ClientId,
+        resource: Resource,
+    },
     /// The device behind `resource` is gone. Its holder keeps the resource (no
     /// revoke, no re-acquire when it returns).
     Suspend {
@@ -179,6 +187,14 @@ impl PolicyEngine {
         rx.await.unwrap_or(AcquireOutcome::Denied {
             reason: "policy engine unavailable".into(),
         })
+    }
+
+    /// Put `resource` into `client`'s hands with an ordinary Grant.
+    pub async fn grant_to(&self, client: ClientId, resource: Resource) {
+        let _ = self
+            .tx
+            .send(EngineCommand::GrantTo { client, resource })
+            .await;
     }
 
     pub async fn release(&self, client: ClientId, resource: Resource) {
@@ -517,6 +533,13 @@ fn handle_command(
             control_reg.insert(client, control);
             debug!("[client {client}] registered with policy engine");
         }
+        EngineCommand::GrantTo { client, resource } => match control_reg.get(&client) {
+            Some(control) => {
+                debug!("Grant to client {client} for {resource:?} (held claim)");
+                let _ = control.send(ControlMessage::Grant { resource });
+            }
+            None => warn!("Grant to client {client} for {resource:?}: no connection"),
+        },
         EngineCommand::Disconnected { client } => {
             control_reg.remove(&client);
             for (resource, slot) in slots.iter_mut() {

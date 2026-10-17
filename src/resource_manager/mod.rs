@@ -76,6 +76,9 @@ pub struct Granted {
     pub fd: OwnedFd,
     /// The plane to draw on, when the resource is a DRM card.
     pub drm: Option<DrmGrant>,
+    /// The client (if any) whose overlay claim was re-honoured by this grant
+    /// and must be told with an ordinary Grant of its own.
+    pub overlay_regranted: Option<ClientId>,
 }
 
 impl Inventory {
@@ -123,7 +126,11 @@ impl Inventory {
                 match plane {
                     PlaneRole::Primary => device
                         .grant_lease(client)
-                        .map(|fd| Granted { fd, drm: None })
+                        .map(|lease| Granted {
+                            fd: lease.fd,
+                            drm: None,
+                            overlay_regranted: lease.overlay_regranted,
+                        })
                         .map_err(|e| anyhow::anyhow!("failed to lease {resource:?}: {e}")),
                     PlaneRole::Overlay => {
                         // The plane is chosen first (it is what the request is
@@ -135,7 +142,11 @@ impl Inventory {
                             .grant_overlay(client)
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                         match device.lease_fd() {
-                            Ok(fd) => Ok(Granted { fd, drm: Some(drm) }),
+                            Ok(fd) => Ok(Granted {
+                                fd,
+                                drm: Some(drm),
+                                overlay_regranted: None,
+                            }),
                             Err(e) => {
                                 device.release_overlay(client);
                                 Err(anyhow::anyhow!("failed to grant {resource:?}: {e}"))
@@ -149,7 +160,11 @@ impl Inventory {
                 .get(resource)
                 .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?
                 .try_clone()
-                .map(|fd| Granted { fd, drm: None })
+                .map(|fd| Granted {
+                    fd,
+                    drm: None,
+                    overlay_regranted: None,
+                })
                 .map_err(|e| anyhow::anyhow!("failed to dup fd for {resource:?}: {e}")),
         }
     }

@@ -87,9 +87,10 @@ pub(super) async fn handle_acquire(
             "[client {client_id} (pid {client_pid})] Acquire: {resource:?} (no policy: an \
              overlay never queues for the display)"
         );
-        match send_grant(stream, client_id, client_pid, resource.clone(), inventory).await {
-            Ok(()) => {
+        return match send_grant(stream, client_id, client_pid, resource.clone(), inventory).await {
+            Ok(_) => {
                 *ack_deadline = Some(Instant::now() + GRANT_ACK_TIMEOUT);
+                Ok(())
             }
             Err(e) => {
                 warn!("[client {client_id} (pid {client_pid})] Denied {resource:?}: {e}");
@@ -97,9 +98,9 @@ pub(super) async fn handle_acquire(
                     reason: e.to_string(),
                 })?;
                 stream.write_all(&resp).await.map_err(ServerError::Write)?;
+                Ok(())
             }
-        }
-        return Ok(());
+        };
     }
 
     match engine.acquire(client_id, resource.clone()).await {
@@ -109,18 +110,37 @@ pub(super) async fn handle_acquire(
             // create_lease failed on an un-leasable card), roll the
             // ownership back so the next waiter can be served, reply Deny,
             // and keep the connection alive.
-            if let Err(e) =
-                send_grant(stream, client_id, client_pid, resource.clone(), inventory).await
+            let overlay_regranted = match send_grant(
+                stream,
+                client_id,
+                client_pid,
+                resource.clone(),
+                inventory,
+            )
+            .await
             {
-                warn!("[client {client_id} (pid {client_pid})] Grant failed for {resource:?}: {e}");
-                engine.release(client_id, resource.clone()).await;
-                let resp = serialize_framed(&ServerMessage::Deny {
-                    reason: format!("grant failed: {e}"),
-                })?;
-                stream.write_all(&resp).await.map_err(ServerError::Write)?;
-                return Ok(());
-            }
+                Ok(regranted) => regranted,
+                Err(e) => {
+                    warn!(
+                        "[client {client_id} (pid {client_pid})] Grant failed for \
+                             {resource:?}: {e}"
+                    );
+                    engine.release(client_id, resource.clone()).await;
+                    let resp = serialize_framed(&ServerMessage::Deny {
+                        reason: format!("grant failed: {e}"),
+                    })?;
+                    stream.write_all(&resp).await.map_err(ServerError::Write)?;
+                    return Ok(());
+                }
+            };
             *ack_deadline = Some(Instant::now() + GRANT_ACK_TIMEOUT);
+
+            // A client that kept an overlay claim across the pipeline change is
+            // told now, by an ordinary Grant: the plane it was promised is the
+            // new pipeline's, under the same resource name it already holds.
+            if let (Some(holder), Resource::Drm { card, .. }) = (overlay_regranted, resource) {
+                engine.grant_to(holder, Resource::drm_overlay(card)).await;
+            }
         }
         AcquireOutcome::Queued => {
             debug!(
@@ -149,7 +169,7 @@ pub(super) async fn send_grant(
     client_pid: pid_t,
     resource: Resource,
     inventory: &Inventory,
-) -> ServerResult<()> {
+) -> ServerResult<Option<ClientId>> {
     // The granted fd must stay open until AFTER send_with_fd: SCM_RIGHTS
     // dups the fd at send time, and sending a number whose fd was already
     // closed fails with EBADF. Binding it here (not inside the match arm)
@@ -172,7 +192,7 @@ pub(super) async fn send_grant(
     stream
         .send_with_fd(&response, &[fd])
         .map_err(ServerError::Write)?;
-    Ok(())
+    Ok(granted.overlay_regranted)
 }
 
 /// Forward a Release to the engine. The engine validates ownership (a

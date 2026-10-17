@@ -168,6 +168,22 @@ pub struct DrmLease {
 #[derive(Debug)]
 pub struct LockedDrmDevice {
     card: DrmCard,
+    /// The client whose overlay of this card outlived the pipeline it was
+    /// granted on. The plane went with the pipeline (its state was cleared
+    /// before the lease was revoked); what survives is the client's right to
+    /// have the next pipeline's plane, which is honoured in `grant_lease`.
+    ///
+    /// This is why an overlay does not have to ask again: it never lost its
+    /// grant, only the plane under it.
+    overlay_hold: Option<ClientId>,
+}
+
+/// What a lease grant hands back: the client's fd, and the client (if any)
+/// whose overlay claim was re-honoured on the new pipeline and must be told
+/// about it with an ordinary Grant.
+pub struct LeaseGrant {
+    pub fd: OwnedFd,
+    pub overlay_regranted: Option<ClientId>,
 }
 
 /// An overlay plane granted out of a pipeline: which plane, which CRTC and
@@ -215,6 +231,9 @@ pub enum OverlayError {
 pub struct LeasedDrmDevice {
     card: DrmCard,
     lease: DrmLease,
+    /// A client this card's overlay is promised to when the pipeline comes
+    /// back. Set only for the moment between the new lease and the re-grant.
+    overlay_hold: Option<ClientId>,
     /// The client the lease was created for — the app on the display. The
     /// lease dies with it, and every overlay grant dies with the lease.
     owner: ClientId,
@@ -226,11 +245,12 @@ impl LockedDrmDevice {
     /// the still-`Locked` device when probing or `create_lease` fails, so
     /// the caller can restore the state unchanged.
     pub fn create_lease(self, owner: ClientId) -> Result<LeasedDrmDevice, (Self, io::Error)> {
+        let overlay_hold = self.overlay_hold;
         let card = self.card;
 
         let objects: Vec<RawResourceHandle> = match lease_objects(&card) {
             Ok(objects) => objects,
-            Err(e) => return Err((Self { card }, e)),
+            Err(e) => return Err((Self { card, overlay_hold }, e)),
         };
 
         match card.create_lease(&objects, 0) {
@@ -243,10 +263,11 @@ impl LockedDrmDevice {
                     card,
                     lease: DrmLease { id, fd },
                     owner,
+                    overlay_hold,
                     overlay: None,
                 })
             }
-            Err(e) => Err((Self { card }, e)),
+            Err(e) => Err((Self { card, overlay_hold }, e)),
         }
     }
 }
@@ -377,6 +398,11 @@ impl LeasedDrmDevice {
     /// client's framebuffer, so the last frame keeps scanning out until
     /// something programs that plane again — and once the grant is dropped
     /// (its owner gone), only the master can.
+    /// The client that holds the granted plane, if one is granted.
+    fn overlay_owner(&self) -> Option<ClientId> {
+        self.overlay.as_ref().map(|grant| grant.owner)
+    }
+
     fn take_overlay(&mut self) -> Option<u32> {
         let grant = self.overlay.take()?;
         clear_plane(&self.card, grant.plane, grant.crtc);
@@ -395,7 +421,10 @@ impl LeasedDrmDevice {
         match card.revoke_lease(lease.id) {
             Ok(()) => {
                 drop(lease.fd);
-                Ok(LockedDrmDevice { card })
+                Ok(LockedDrmDevice {
+                    card,
+                    overlay_hold: None,
+                })
             }
             Err(e) => Err((
                 LeasedDrmDevice {
@@ -406,6 +435,7 @@ impl LeasedDrmDevice {
                     },
                     owner: self.owner,
                     overlay: self.overlay,
+                    overlay_hold: self.overlay_hold,
                 },
                 e,
             )),
@@ -443,11 +473,11 @@ impl DrmDevice {
     /// pipeline it already holds), and a *different* client is a handover —
     /// the old lease, and every overlay grant of it, is revoked first, because
     /// the kernel cannot lease the same objects twice.
-    pub fn grant_lease(&self, owner: ClientId) -> io::Result<OwnedFd> {
+    pub fn grant_lease(&self, owner: ClientId) -> io::Result<LeaseGrant> {
         let mut guard = self.state.lock().unwrap();
         let current = guard.take().expect("state always present");
 
-        let leased = match current {
+        let mut leased = match current {
             DrmDeviceState::Leased(dev) if dev.owner == owner => dev,
             DrmDeviceState::Locked(dev) => match dev.create_lease(owner) {
                 Ok(leased) => leased,
@@ -457,24 +487,76 @@ impl DrmDevice {
                     return Err(e);
                 }
             },
-            DrmDeviceState::Leased(dev) => match dev.revoke_lease() {
-                Ok(locked) => match locked.create_lease(owner) {
-                    Ok(leased) => {
-                        debug!("Revoked the previous lease on card{}", self.index);
-                        leased
+            DrmDeviceState::Leased(mut dev) => {
+                // A handover is a pipeline change, not the overlay's business:
+                // clear the plane of the old pipeline and keep the holder's
+                // claim, so it is honoured on the new one below.
+                let overlay_holder = dev.overlay_owner();
+                if let Some(plane) = dev.take_overlay() {
+                    info!(
+                        "card{}: overlay plane {plane} cleared — the display changed hands",
+                        self.index
+                    );
+                }
+                match dev.revoke_lease() {
+                    Ok(mut locked) => {
+                        if let Some(holder) = overlay_holder {
+                            info!(
+                                "card{}: client {holder} keeps its overlay claim across the \
+                                 handover — it is re-granted on the new pipeline",
+                                self.index
+                            );
+                            locked.overlay_hold = Some(holder);
+                        }
+                        match locked.create_lease(owner) {
+                            Ok(leased) => {
+                                debug!("Revoked the previous lease on card{}", self.index);
+                                leased
+                            }
+                            Err((dev, e)) => {
+                                error!(
+                                    "Failed to lease card{} for client {owner}: {e}",
+                                    self.index
+                                );
+                                *guard = Some(DrmDeviceState::Locked(dev));
+                                return Err(e);
+                            }
+                        }
                     }
                     Err((dev, e)) => {
-                        error!("Failed to lease card{} for client {owner}: {e}", self.index);
-                        *guard = Some(DrmDeviceState::Locked(dev));
+                        error!("Failed to revoke stale lease on card{}: {e}", self.index);
+                        *guard = Some(DrmDeviceState::Leased(dev));
                         return Err(e);
                     }
-                },
-                Err((dev, e)) => {
-                    error!("Failed to revoke stale lease on card{}: {e}", self.index);
-                    *guard = Some(DrmDeviceState::Leased(dev));
-                    return Err(e);
+                }
+            }
+        };
+
+        // A client whose overlay outlived the last pipeline gets the new
+        // pipeline's plane now, under the same lock that made the lease: there
+        // is no window in which another client could take it. It is told with
+        // an ordinary Grant, so the client needs no special path for it.
+        let overlay_regranted = match leased.overlay_hold.take() {
+            Some(holder) => match leased.grant_overlay(holder) {
+                Ok(grant) => {
+                    info!(
+                        "card{}: overlay plane {} (crtc {}) re-granted to client {holder} \
+                         — the pipeline is back",
+                        self.index, grant.plane_id, grant.crtc_id
+                    );
+                    Some(holder)
+                }
+                Err(e) => {
+                    warn!(
+                        "card{}: could not re-grant the overlay to client {holder} yet: {e} \
+                         — it stays promised",
+                        self.index
+                    );
+                    leased.overlay_hold = Some(holder);
+                    None
                 }
             },
+            None => None,
         };
 
         // Hand the client a dup; the server keeps its own copy in the Leased
@@ -482,7 +564,10 @@ impl DrmDevice {
         match leased.fd() {
             Ok(fd) => {
                 *guard = Some(DrmDeviceState::Leased(leased));
-                Ok(fd)
+                Ok(LeaseGrant {
+                    fd,
+                    overlay_regranted,
+                })
             }
             Err(e) => {
                 error!("Failed to dup lease fd on card{}: {e}", self.index);
@@ -531,6 +616,7 @@ impl DrmDevice {
 
         *guard = Some(match current {
             DrmDeviceState::Leased(mut dev) if dev.owner == owner => {
+                let overlay_holder = dev.overlay_owner();
                 if let Some(plane) = dev.take_overlay() {
                     info!(
                         "card{}: overlay plane {plane} cleared — the display owner is gone",
@@ -538,11 +624,21 @@ impl DrmDevice {
                     );
                 }
                 match dev.revoke_lease() {
-                    Ok(locked) => {
+                    Ok(mut locked) => {
                         info!(
                             "card{}: lease revoked — client {owner} held the display and is gone",
                             self.index
                         );
+                        if let Some(holder) = overlay_holder {
+                            // The overlay's claim survives the pipeline: the
+                            // plane went with it, the promise did not.
+                            info!(
+                                "card{}: client {holder} keeps its overlay claim across the \
+                                 pipeline change — it is re-granted when a display is back",
+                                self.index
+                            );
+                            locked.overlay_hold = Some(holder);
+                        }
                         DrmDeviceState::Locked(locked)
                     }
                     Err((dev, e)) => {
@@ -565,9 +661,22 @@ impl DrmDevice {
         *guard = Some(match current {
             DrmDeviceState::Leased(mut dev) => {
                 dev.release_overlay(owner);
+                if dev.overlay_hold == Some(owner) {
+                    dev.overlay_hold = None;
+                }
                 DrmDeviceState::Leased(dev)
             }
-            locked => locked,
+            DrmDeviceState::Locked(mut dev) => {
+                if dev.overlay_hold == Some(owner) {
+                    info!(
+                        "card{}: client {owner} gave up its overlay claim while no display is \
+                         driven",
+                        self.index
+                    );
+                    dev.overlay_hold = None;
+                }
+                DrmDeviceState::Locked(dev)
+            }
         });
     }
 
@@ -967,6 +1076,7 @@ pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>
             DrmDevice {
                 index: opened.index,
                 state: Mutex::new(Some(DrmDeviceState::Locked(LockedDrmDevice {
+                    overlay_hold: None,
                     card: opened.card,
                 }))),
             },
