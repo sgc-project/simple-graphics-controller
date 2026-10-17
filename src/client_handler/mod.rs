@@ -109,7 +109,10 @@ pub async fn handle_connection(
     .await;
 
     info!("[client {client_id} (pid {client_pid})] Client disconnected");
+    // The engine's own bookkeeping first (the resources it granted), then what
+    // never went through it: the overlay planes, which a client owns directly.
     engine.disconnected(client_id).await;
+    inventory.release_client(client_id);
     result?;
 
     Ok(())

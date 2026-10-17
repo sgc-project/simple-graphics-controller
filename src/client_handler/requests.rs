@@ -1,6 +1,10 @@
 //! Client request semantics: Acquire (ask the engine, reply Grant/Deny or
 //! stay silent for a queue), Release (forward to the engine), Ack (clear
 //! the grant-ack timer).
+//!
+//! The overlay role is granted without the engine, because it is not a claim
+//! on the display: it takes no slot, queues behind nobody and preempts
+//! nothing.
 
 use std::os::fd::AsRawFd;
 
@@ -69,22 +73,32 @@ pub(super) async fn handle_acquire(
 ) -> ServerResult<()> {
     info!("[client {client_id} (pid {client_pid})] Acquire: {resource:?}");
 
-    // The overlay role is part of the protocol but not of what this server
-    // grants yet: a lease over primary planes only has no overlay in it to hand
-    // over. Refuse it here, before the policy engine — an overlay must never
-    // queue for, or preempt, the app on the display.
+    // The overlay role is granted outside the policy engine, on purpose: a
+    // plane of the pipeline is not a claim on the display, so an overlay
+    // request must never queue for, be queued behind, or preempt the app on
+    // it. It is granted if it is free and refused if another client holds it —
+    // that client releases it, or disconnects.
     if let Resource::Drm {
-        card,
         plane: PlaneRole::Overlay,
+        ..
     } = resource
     {
-        let reason = format!(
-            "overlay planes are not granted yet (card {card}: this server leases the primary \
-             plane only)"
+        debug!(
+            "[client {client_id} (pid {client_pid})] Acquire: {resource:?} (no policy: an \
+             overlay never queues for the display)"
         );
-        warn!("[client {client_id} (pid {client_pid})] Denied {resource:?}: {reason}");
-        let resp = serialize_framed(&ServerMessage::Deny { reason })?;
-        stream.write_all(&resp).await.map_err(ServerError::Write)?;
+        match send_grant(stream, client_id, client_pid, resource.clone(), inventory).await {
+            Ok(()) => {
+                *ack_deadline = Some(Instant::now() + GRANT_ACK_TIMEOUT);
+            }
+            Err(e) => {
+                warn!("[client {client_id} (pid {client_pid})] Denied {resource:?}: {e}");
+                let resp = serialize_framed(&ServerMessage::Deny {
+                    reason: e.to_string(),
+                })?;
+                stream.write_all(&resp).await.map_err(ServerError::Write)?;
+            }
+        }
         return Ok(());
     }
 
@@ -140,11 +154,21 @@ pub(super) async fn send_grant(
     // dups the fd at send time, and sending a number whose fd was already
     // closed fails with EBADF. Binding it here (not inside the match arm)
     // keeps it alive across the send.
-    let granted = inventory.grant_fd(&resource)?;
-    let fd = granted.as_raw_fd();
+    let granted = inventory.grant_fd(&resource, client_id)?;
+    let fd = granted.fd.as_raw_fd();
 
-    info!("[client {client_id} (pid {client_pid})] Granted {resource:?} (fd {fd})");
-    let response = serialize_framed(&ServerMessage::Grant { resource })?;
+    match &granted.drm {
+        Some(drm) => info!(
+            "[client {client_id} (pid {client_pid})] Granted {resource:?} (plane {} crtc {} fd \
+             {fd})",
+            drm.plane_id, drm.crtc_id
+        ),
+        None => info!("[client {client_id} (pid {client_pid})] Granted {resource:?} (fd {fd})"),
+    }
+    let response = serialize_framed(&ServerMessage::Grant {
+        resource,
+        drm: granted.drm,
+    })?;
     stream
         .send_with_fd(&response, &[fd])
         .map_err(ServerError::Write)?;
@@ -156,12 +180,27 @@ pub(super) async fn send_grant(
 /// it warns and requeues accordingly). A `Drm` lease is revoked
 /// immediately: the resource must be truly free before the next grant,
 /// kernel-enforced, regardless of what the client does with its fd.
+///
+/// The overlay role is the exception: it never took a slot in the engine, so
+/// releasing it frees its plane and stops there. The pipeline belongs to the
+/// client still on the display, and that client keeps drawing.
 pub(super) async fn handle_release(
     client_id: ClientId,
     resource: Resource,
     engine: &PolicyEngine,
     inventory: &Inventory,
 ) {
-    inventory.revoke_lease(&resource);
+    inventory.revoke_lease(&resource, client_id);
+
+    if matches!(
+        resource,
+        Resource::Drm {
+            plane: PlaneRole::Overlay,
+            ..
+        }
+    ) {
+        return;
+    }
+
     engine.release(client_id, resource).await;
 }

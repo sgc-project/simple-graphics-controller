@@ -1,23 +1,49 @@
 //! DRM backend: open display-capable cards (`/dev/dri/cardN`) as DRM master
 //! and register each as `Resource::drm(card)` — the card's PRIMARY plane, the
-//! one an app on the display draws through. The overlay role of the same card
-//! is part of the protocol and refused here for now (see
-//! [`Resource::drm_overlay`] and `docs/resource-manager.md`).
+//! one an app on the display draws through — and `Resource::drm_overlay(card)`
+//! — one of that pipeline's overlay planes, stacked above the primary.
 //!
 //! Compiled only with the `drm` feature (default). The master fd never
-//! leaves the server: every grant creates a FRESH lease over the card's
-//! objects (see [`DrmDevice::grant_lease`]) and revocation is
-//! kernel-enforced. Registration order IS the advertised priority order
-//! (first is best): the card selection logic lives here with the open.
+//! leaves the server: grants hand the client a lease fd (see
+//! [`DrmDevice::grant_lease`]) and revocation is kernel-enforced.
+//! Registration order IS the advertised priority order (first is best): the
+//! card selection logic lives here with the open.
+//!
+//! # One lease per pipeline, shared by its clients
+//!
+//! The kernel forbids two leases over the same CRTC (`EBUSY`) and rejects a
+//! lease without a CRTC, a connector and a plane (`EINVAL`), so a display
+//! pipeline can only ever be leased once — and a lease is a `drm_master`, not
+//! a process, so several clients can hold dups of that one lease. The lease is
+//! therefore created for the pipeline's owner and *reused* for a client that
+//! asks for an overlay, which is what makes a plane grantable at all: the
+//! client programs the granted plane itself, through the same lease.
+//!
+//! A client that asks for the overlay role is granted one overlay plane (the
+//! highest one that can drive the pipeline's CRTC, raised above the primary)
+//! and owns it until it releases the resource; the daemon clears the plane on
+//! release, because a dropped grant is not a cleared plane — the plane state
+//! keeps its own reference to the client's framebuffer, so the last frame
+//! keeps scanning out until somebody programs that plane again. Only the
+//! master can do that once the client is gone.
+//!
+//! What this is not: a sandbox. Every client holding the shared lease can
+//! program every plane in it, so which plane a client uses is policy the
+//! daemon keeps, not something the kernel enforces between them. The parts
+//! that ARE kernel-enforced are the lease itself (torn down with the pipeline
+//! owner, taking every grant with it) and what the lease leaves out: cursor
+//! planes, so a client can never reprogram the server's pointer, and any other
+//! plane the server keeps for itself by simply not leasing it.
 //!
 //! A card's life is a type-state machine — [`DrmDeviceState::Locked`]
 //! (master held, leaseable) or [`DrmDeviceState::Leased`] (master + one
-//! live lease). Transitions consume the state and return `Result<Next,
-//! Self>`: an ioctl failure hands back the state you were in, so a card can
-//! never be lost or double-leased — the failure path is a retry, not a
-//! leak. The state lives behind `Mutex<Option<...>>` because the engine can
-//! push a Revoke for one task while another task runs a grant on the same
-//! card (see docs/resource-manager.md).
+//! live lease, its owner, and any overlay grant of it). Transitions consume
+//! the state and return `Result<Next, Self>`: an ioctl failure hands back the
+//! state you were in, so a card can never be lost or double-leased — the
+//! failure path is a retry, not a leak. The state lives behind
+//! `Mutex<Option<...>>` because the engine can push a Revoke for one task
+//! while another task runs a grant on the same card (see
+//! docs/resource-manager.md).
 
 use std::{
     fs::{File, read_dir},
@@ -32,12 +58,20 @@ use std::{
 
 use dashmap::DashMap;
 use drm::Device;
+use drm::control::atomic::AtomicModeReq;
 use drm::control::{
-    Device as ControlDevice, LeaseId, RawResourceHandle, ResourceHandles, connector,
+    AtomicCommitFlags, Device as ControlDevice, LeaseId, RawResourceHandle, ResourceHandles,
+    connector, crtc, plane, property,
 };
 use nix::fcntl::OFlag;
-use simple_graphics_protocol::Resource;
-use tracing::{debug, error, info};
+use simple_graphics_protocol::{DrmGrant, PlaneRole, Resource};
+use thiserror::Error;
+use tracing::{debug, error, info, trace, warn};
+
+use crate::resource_manager::overlay_policy::{
+    self, OverlayClaim, OverlayDecision, OverlayGrantView, OverlayPolicy,
+};
+use crate::types::ClientId;
 
 /// The server's DRM master handle for one card: a plain fd wrapper that
 /// implements the `drm` crate's `Device` traits (the crate deliberately
@@ -46,17 +80,22 @@ use tracing::{debug, error, info};
 /// The master is what creates leases. It is held by the server for the
 /// whole run: closing it would destroy every lease it created.
 #[derive(Debug)]
-pub struct DrmCard(File);
+pub struct DrmCard {
+    file: File,
+    /// The card's index, as in `/dev/dri/cardN` — what every message about
+    /// this card names it by.
+    index: u8,
+}
 
 impl AsFd for DrmCard {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        self.file.as_fd()
     }
 }
 
 impl AsRawFd for DrmCard {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.file.as_raw_fd()
     }
 }
 
@@ -67,13 +106,36 @@ impl DrmCard {
     /// Open a DRM card node the way a display server should: `O_RDWR` for
     /// modesetting, `O_CLOEXEC` so the fd never leaks into children, and
     /// `O_NONBLOCK` so event reads on the fd can never block.
-    fn open(path: &Path) -> io::Result<Self> {
+    fn open(path: &Path, index: u8) -> io::Result<Self> {
         let file = File::options()
             .read(true)
             .write(true)
             .custom_flags((OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).bits())
             .open(path)?;
-        Ok(Self(file))
+        Ok(Self { file, index })
+    }
+
+    /// Planes the server programs from the master fd. A driver without atomic
+    /// mode setting is still a usable display server — the z-order step is the
+    /// only part that needs it, and it degrades to a warning.
+    fn enable_plane_capabilities(&self) {
+        for (capability, missing) in [
+            (
+                drm::ClientCapability::UniversalPlanes,
+                "planes will not be leased (a lease still needs a CRTC and a connector)",
+            ),
+            (
+                drm::ClientCapability::Atomic,
+                "the overlay plane cannot be raised above the primary",
+            ),
+        ] {
+            if let Err(e) = self.set_client_capability(capability, true) {
+                warn!(
+                    "card{}: {capability:?} unavailable: {e} — {missing}",
+                    self.index
+                );
+            }
+        }
     }
 }
 
@@ -108,18 +170,62 @@ pub struct LockedDrmDevice {
     card: DrmCard,
 }
 
-/// Master held + one live lease.
+/// An overlay plane granted out of a pipeline: which plane, which CRTC and
+/// connector it drives, and the client that owns it until it releases.
+#[derive(Debug)]
+struct OverlayGrant {
+    plane: plane::Handle,
+    crtc: crtc::Handle,
+    connector: Option<connector::Handle>,
+    owner: ClientId,
+}
+
+impl OverlayGrant {
+    /// What the owning client is told it may draw on.
+    fn detail(&self) -> DrmGrant {
+        DrmGrant {
+            plane: PlaneRole::Overlay,
+            plane_id: u32::from(self.plane),
+            crtc_id: u32::from(self.crtc),
+            connector_id: self.connector.map(u32::from),
+        }
+    }
+}
+
+/// Why an overlay request could not be served. Every arm is a sentence the
+/// client can act on, because that is what it is sent as.
+#[derive(Debug, Error)]
+pub enum OverlayError {
+    /// Nobody holds the display, so there is no pipeline to put a plane on.
+    #[error("no client holds the display (card {0}: acquire its primary plane first)")]
+    NoPipeline(u8),
+    /// Another client holds the overlay; it is released when that client is done.
+    #[error("the overlay plane of card {0} is held by client {1}")]
+    HeldByOther(u8, ClientId),
+    /// Nowhere to put a plane: the pipeline has no usable overlay.
+    #[error("card {0} has no overlay plane that can drive crtc {1}")]
+    NoFreePlane(u8, u32),
+    /// The card could not be queried or programmed.
+    #[error("card {0}: {1}")]
+    Io(u8, io::Error),
+}
+
+/// Master held + one live lease: its owner and any overlay grant of it.
 #[derive(Debug)]
 pub struct LeasedDrmDevice {
     card: DrmCard,
     lease: DrmLease,
+    /// The client the lease was created for — the app on the display. The
+    /// lease dies with it, and every overlay grant dies with the lease.
+    owner: ClientId,
+    overlay: Option<OverlayGrant>,
 }
 
 impl LockedDrmDevice {
     /// Query the card's objects fresh and lease them all. Returns `Err` with
     /// the still-`Locked` device when probing or `create_lease` fails, so
     /// the caller can restore the state unchanged.
-    pub fn create_lease(self) -> Result<LeasedDrmDevice, (Self, io::Error)> {
+    pub fn create_lease(self, owner: ClientId) -> Result<LeasedDrmDevice, (Self, io::Error)> {
         let card = self.card;
 
         let objects: Vec<RawResourceHandle> = match lease_objects(&card) {
@@ -129,10 +235,15 @@ impl LockedDrmDevice {
 
         match card.create_lease(&objects, 0) {
             Ok((id, fd)) => {
-                info!("Created lease {id} ({} objects)", objects.len());
+                info!(
+                    "Created lease {id} for client {owner} ({} objects)",
+                    objects.len()
+                );
                 Ok(LeasedDrmDevice {
                     card,
                     lease: DrmLease { id, fd },
+                    owner,
+                    overlay: None,
                 })
             }
             Err(e) => Err((Self { card }, e)),
@@ -141,6 +252,137 @@ impl LockedDrmDevice {
 }
 
 impl LeasedDrmDevice {
+    /// A dup of the lease's fd, for the client being granted something of it.
+    fn fd(&self) -> io::Result<OwnedFd> {
+        self.lease.fd.try_clone()
+    }
+
+    /// Grant this pipeline's overlay plane to `owner`, or hand back the grant
+    /// it already holds. Which plane: the highest one that can drive the
+    /// pipeline's CRTC, so a driver that orders its planes overlay-first (or
+    /// stacks several) gives up its topmost one first — the plane most likely
+    /// to already sit above the primary. Idempotent, because a client asking
+    /// again for what it holds must not be handed a second plane.
+    fn grant_overlay(&mut self, owner: ClientId) -> Result<DrmGrant, OverlayError> {
+        let index = self.card.index;
+
+        // The policy owns who gets the plane; this function owns how a plane is
+        // picked and programmed once the policy says yes.
+        let held: Vec<OverlayGrantView> = self
+            .overlay
+            .as_ref()
+            .map(|grant| OverlayGrantView {
+                client: grant.owner,
+                plane: u32::from(grant.plane),
+                crtc: u32::from(grant.crtc),
+            })
+            .into_iter()
+            .collect();
+        // What the decision was made from, so a refusal can be read back
+        // without guessing which plane the asker lost to.
+        let claim = OverlayClaim {
+            client: owner,
+            card: index,
+        };
+        trace!(
+            "card{}: client {owner} asks for the overlay; held: [{}]",
+            claim.card,
+            held.iter()
+                .map(|grant| format!(
+                    "client {} on plane {} (crtc {})",
+                    grant.client, grant.plane, grant.crtc
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        match overlay_policy::NoPreemption.decide(&claim, &held) {
+            OverlayDecision::Grant => {}
+            OverlayDecision::Refuse { holder } => {
+                return Err(OverlayError::HeldByOther(index, holder));
+            }
+        }
+
+        // Allowed, and already this client's: the same grant, restated — not a
+        // second plane picked for a client that holds one.
+        if let Some(grant) = &self.overlay {
+            return Ok(grant.detail());
+        }
+
+        let io_error = |e: io::Error| OverlayError::Io(index, e);
+        let (crtc, connector) = live_pipeline(&self.card).ok_or(OverlayError::NoPipeline(index))?;
+        let plane = overlay_candidates(&self.card, crtc)
+            .map_err(io_error)?
+            .into_iter()
+            .max_by_key(|(_, zpos)| *zpos)
+            .map(|(plane, _)| plane)
+            .ok_or_else(|| OverlayError::NoFreePlane(index, u32::from(crtc)))?;
+
+        if let Err(e) = raise_plane_above_primary(&self.card, plane) {
+            warn!(
+                "card{index}: could not raise overlay plane {} above the primary: {e} — it may \
+                 be occluded by the client on it",
+                u32::from(plane)
+            );
+        }
+
+        let grant = OverlayGrant {
+            plane,
+            crtc,
+            connector,
+            owner,
+        };
+        let detail = grant.detail();
+        info!(
+            "card{index}: granted overlay plane {} (crtc {}) to client {owner}",
+            detail.plane_id, detail.crtc_id
+        );
+        self.overlay = Some(grant);
+        Ok(detail)
+    }
+
+    /// Take the overlay grant back: free the plane and program it off the
+    /// pipeline. Clearing is the point — the plane state holds its own
+    /// reference to the client's framebuffer, so a client that is gone would
+    /// leave its last frame scanning out of a pipeline nothing else touches,
+    /// and only the master can program that plane now.
+    ///
+    /// Only the holder gets to do this. A Release from anybody else — a client
+    /// that was refused the plane, or one that opened a connection and left —
+    /// must not take a plane it never had, which is why the owner is checked
+    /// before anything is cleared.
+    fn release_overlay(&mut self, owner: ClientId) {
+        let Some(grant) = &self.overlay else {
+            return;
+        };
+        if grant.owner != owner {
+            warn!(
+                "card{}: client {owner} tried to release the overlay plane held by client {} \
+                 — leaving it with its owner",
+                self.card.index, grant.owner
+            );
+            return;
+        }
+        if let Some(plane) = self.take_overlay() {
+            info!(
+                "card{}: overlay plane {plane} released by client {owner}",
+                self.card.index
+            );
+        }
+    }
+
+    /// Drop the overlay grant and program its plane off the pipeline.
+    /// Returns the plane that was cleared, if there was one.
+    ///
+    /// Clearing is the point: the plane state holds its own reference to the
+    /// client's framebuffer, so the last frame keeps scanning out until
+    /// something programs that plane again — and once the grant is dropped
+    /// (its owner gone), only the master can.
+    fn take_overlay(&mut self) -> Option<u32> {
+        let grant = self.overlay.take()?;
+        clear_plane(&self.card, grant.plane, grant.crtc);
+        Some(u32::from(grant.plane))
+    }
+
     /// Kernel-revoke the lease. On success the lease is dead (even if the
     /// client keeps its fd open) and we drop our fd copy, returning to
     /// `Locked`. On failure return `Err(Self)` — id and fd are preserved,
@@ -162,6 +404,8 @@ impl LeasedDrmDevice {
                         id: lease.id,
                         fd: lease.fd,
                     },
+                    owner: self.owner,
+                    overlay: self.overlay,
                 },
                 e,
             )),
@@ -193,21 +437,38 @@ pub struct DrmDevice {
 }
 
 impl DrmDevice {
-    /// Create a fresh lease for a grant and return its fd. Any still-active
-    /// lease is revoked first (a previous owner may have died without
-    /// releasing): the kernel cannot lease the same objects twice.
-    pub fn grant_lease(&self) -> io::Result<OwnedFd> {
+    /// The pipeline's lease fd for `owner`, creating the lease when the card
+    /// is free. The lease is shared, not per client: the same owner asking
+    /// again gets another dup of it (a re-acquire, or the overlay role of the
+    /// pipeline it already holds), and a *different* client is a handover —
+    /// the old lease, and every overlay grant of it, is revoked first, because
+    /// the kernel cannot lease the same objects twice.
+    pub fn grant_lease(&self, owner: ClientId) -> io::Result<OwnedFd> {
         let mut guard = self.state.lock().unwrap();
         let current = guard.take().expect("state always present");
 
-        // Ensure the card is Locked: revoke any live lease first.
-        let locked = match current {
-            DrmDeviceState::Locked(dev) => dev,
-            DrmDeviceState::Leased(dev) => match dev.revoke_lease() {
-                Ok(dev) => {
-                    debug!("Revoked stale lease on card{}", self.index);
-                    dev
+        let leased = match current {
+            DrmDeviceState::Leased(dev) if dev.owner == owner => dev,
+            DrmDeviceState::Locked(dev) => match dev.create_lease(owner) {
+                Ok(leased) => leased,
+                Err((dev, e)) => {
+                    error!("Failed to lease card{}: {e}", self.index);
+                    *guard = Some(DrmDeviceState::Locked(dev));
+                    return Err(e);
                 }
+            },
+            DrmDeviceState::Leased(dev) => match dev.revoke_lease() {
+                Ok(locked) => match locked.create_lease(owner) {
+                    Ok(leased) => {
+                        debug!("Revoked the previous lease on card{}", self.index);
+                        leased
+                    }
+                    Err((dev, e)) => {
+                        error!("Failed to lease card{} for client {owner}: {e}", self.index);
+                        *guard = Some(DrmDeviceState::Locked(dev));
+                        return Err(e);
+                    }
+                },
                 Err((dev, e)) => {
                     error!("Failed to revoke stale lease on card{}: {e}", self.index);
                     *guard = Some(DrmDeviceState::Leased(dev));
@@ -216,29 +477,108 @@ impl DrmDevice {
             },
         };
 
-        match locked.create_lease() {
-            Ok(leased) => {
-                // Hand the client a dup; the server keeps its own copy in
-                // the Leased state (see DrmLease).
-                let fd = leased.lease.fd.try_clone();
-                match fd {
-                    Ok(fd) => {
-                        *guard = Some(DrmDeviceState::Leased(leased));
-                        Ok(fd)
+        // Hand the client a dup; the server keeps its own copy in the Leased
+        // state (see DrmLease).
+        match leased.fd() {
+            Ok(fd) => {
+                *guard = Some(DrmDeviceState::Leased(leased));
+                Ok(fd)
+            }
+            Err(e) => {
+                error!("Failed to dup lease fd on card{}: {e}", self.index);
+                // Lease is alive but unsendable; put it back Leased so a later
+                // grant revokes and retries it.
+                *guard = Some(DrmDeviceState::Leased(leased));
+                Err(e)
+            }
+        }
+    }
+
+    /// Grant this card's overlay plane to `owner` and say what to draw on. The
+    /// client programs it through the pipeline's lease, so no fd comes back —
+    /// [`Self::lease_fd`] hands out that dup. A card nobody holds has no
+    /// pipeline, and no pipeline has no planes to put on screen.
+    pub fn grant_overlay(&self, owner: ClientId) -> Result<DrmGrant, OverlayError> {
+        let mut guard = self.state.lock().unwrap();
+        let current = guard.take().expect("state always present");
+
+        let (next, result) = match current {
+            DrmDeviceState::Locked(dev) => (
+                DrmDeviceState::Locked(dev),
+                Err(OverlayError::NoPipeline(self.index)),
+            ),
+            DrmDeviceState::Leased(mut dev) => {
+                let result = dev.grant_overlay(owner);
+                (DrmDeviceState::Leased(dev), result)
+            }
+        };
+        *guard = Some(next);
+        result
+    }
+
+    /// The pipeline's owner is gone (its connection ended, or it was killed):
+    /// revoke the lease, and every overlay grant of it with it. The granted
+    /// plane is cleared first — the state that records it is what is about to
+    /// go, and a client that is gone cannot clear its own plane.
+    ///
+    /// Without this a lease would outlive the app it was made for: the CRTC
+    /// keeps its mode, so the pipeline still looks alive, and the next client
+    /// asking for an overlay would be granted a plane of a display nobody is
+    /// driving.
+    pub fn revoke_lease_if_owned_by(&self, owner: ClientId) {
+        let mut guard = self.state.lock().unwrap();
+        let current = guard.take().expect("state always present");
+
+        *guard = Some(match current {
+            DrmDeviceState::Leased(mut dev) if dev.owner == owner => {
+                if let Some(plane) = dev.take_overlay() {
+                    info!(
+                        "card{}: overlay plane {plane} cleared — the display owner is gone",
+                        self.index
+                    );
+                }
+                match dev.revoke_lease() {
+                    Ok(locked) => {
+                        info!(
+                            "card{}: lease revoked — client {owner} held the display and is gone",
+                            self.index
+                        );
+                        DrmDeviceState::Locked(locked)
                     }
-                    Err(e) => {
-                        error!("Failed to dup lease fd on card{}: {e}", self.index);
-                        // Lease is alive but unsendable; put it back Leased
-                        // so a later grant revokes and retries it.
-                        *guard = Some(DrmDeviceState::Leased(leased));
-                        Err(e)
+                    Err((dev, e)) => {
+                        error!("Failed to revoke the lease of card{}: {e}", self.index);
+                        DrmDeviceState::Leased(dev)
                     }
                 }
             }
-            Err((dev, e)) => {
-                *guard = Some(DrmDeviceState::Locked(dev));
-                Err(e)
+            other => other,
+        });
+    }
+
+    /// Give the overlay plane back: the client owns it until it does, and it
+    /// is free for another client afterwards. The lease itself is untouched —
+    /// this client only held a plane of it.
+    pub fn release_overlay(&self, owner: ClientId) {
+        let mut guard = self.state.lock().unwrap();
+        let current = guard.take().expect("state always present");
+
+        *guard = Some(match current {
+            DrmDeviceState::Leased(mut dev) => {
+                dev.release_overlay(owner);
+                DrmDeviceState::Leased(dev)
             }
+            locked => locked,
+        });
+    }
+
+    /// A dup of the live lease's fd, for a client that holds something of the
+    /// pipeline without being its owner. `Err` when the card has no lease:
+    /// [`Self::grant_overlay`] is what decides whether a client may have one.
+    pub fn lease_fd(&self) -> io::Result<OwnedFd> {
+        let guard = self.state.lock().unwrap();
+        match guard.as_ref().expect("state always present") {
+            DrmDeviceState::Leased(dev) => dev.fd(),
+            DrmDeviceState::Locked(_) => Err(io::Error::other("card has no live lease")),
         }
     }
 
@@ -265,26 +605,264 @@ impl DrmDevice {
     }
 }
 
-/// The card's leaseable objects as `RawResourceHandle`s, queried fresh:
-/// every CRTC and plane, and every display connector (writeback connectors
-/// are capture-only and cannot present a display). A connector whose probe
-/// failed is kept rather than silently dropped.
+/// The pipeline this card is driving: the CRTC that has a mode set, and the
+/// connector its encoder drives when the kernel reports one. `None` while
+/// nothing is programmed — a client acquires the display first and sets the
+/// mode, so an overlay request that arrives before that has no pipeline to
+/// join.
+fn live_pipeline(card: &DrmCard) -> Option<(crtc::Handle, Option<connector::Handle>)> {
+    let handles = card.resource_handles().ok()?;
+    let crtc = handles.crtcs.iter().copied().find(|handle| {
+        card.get_crtc(*handle)
+            .is_ok_and(|info| info.mode().is_some())
+    })?;
+
+    let connector = handles.connectors.iter().copied().find(|handle| {
+        card.get_connector(*handle, false)
+            .ok()
+            .and_then(|info| info.current_encoder())
+            .and_then(|encoder| card.get_encoder(encoder).ok())
+            .and_then(|info| info.crtc())
+            .is_some_and(|driven| driven == crtc)
+    });
+
+    Some((crtc, connector))
+}
+
+/// The card's overlay planes that can drive `crtc`, paired with their current
+/// z-position so the caller can take the topmost.
+fn overlay_candidates(card: &DrmCard, crtc: crtc::Handle) -> io::Result<Vec<(plane::Handle, u64)>> {
+    let handles = card.resource_handles()?;
+    let mut candidates = Vec::new();
+
+    for plane in card.plane_handles()? {
+        if plane_kind(card, plane) != Some(PlaneKind::Overlay) {
+            continue;
+        }
+        let info = card.get_plane(plane)?;
+        if !handles.filter_crtcs(info.possible_crtcs()).contains(&crtc) {
+            continue;
+        }
+        let zpos = zpos(card, plane).map_or(0, |(_, value, _)| value);
+        candidates.push((plane, zpos));
+    }
+
+    Ok(candidates)
+}
+
+/// The card's primary plane, by its `type` property: never "the first plane
+/// that can drive the CRTC", because a driver may order its pipeline
+/// overlay-first (sun4i does).
+fn primary_plane(card: &DrmCard) -> io::Result<Option<plane::Handle>> {
+    Ok(card
+        .plane_handles()?
+        .into_iter()
+        .find(|plane| plane_kind(card, *plane) == Some(PlaneKind::Primary)))
+}
+
+/// A named property of an object: its handle and its raw value.
+fn find_property<H: drm::control::ResourceHandle>(
+    card: &DrmCard,
+    object: H,
+    name: &str,
+) -> Option<(property::Handle, property::RawValue)> {
+    for (handle, raw) in card.get_properties(object).ok()? {
+        let info = card.get_property(handle).ok()?;
+        if info.name().to_bytes() == name.as_bytes() {
+            return Some((handle, raw));
+        }
+    }
+    None
+}
+
+/// A plane's `zpos`: its property handle, current value, and the range the
+/// driver accepts. A driver that declares zpos immutable reports a range of
+/// one value — the range is how you tell, not the property's flags.
+fn zpos(card: &DrmCard, plane: plane::Handle) -> Option<(property::Handle, u64, (u64, u64))> {
+    let (handle, raw) = find_property(card, plane, "zpos")?;
+    let range = match card.get_property(handle).ok()?.value_type() {
+        property::ValueType::UnsignedRange(lo, hi) => (*lo, *hi),
+        _ => (raw, raw),
+    };
+    Some((handle, raw, range))
+}
+
+/// What has to move for a granted overlay to sit above the primary.
+#[derive(Debug, PartialEq, Eq)]
+struct StackingPlan {
+    /// The overlay's new z-position.
+    overlay: u64,
+    /// The primary's new z-position, when it has to move down to make room.
+    primary: Option<u64>,
+}
+
+/// Where the two planes have to move, or `None` when they need not — and
+/// `None` must mean "name neither of them in a commit": a plane whose zpos is
+/// immutable rejects any request that mentions it, even with the value it
+/// already holds, which fails the whole commit and leaves the grant where it
+/// was.
+///
+/// `overlay` and `primary` are each `(current value, accepted range)`.
+fn stacking_plan(overlay: (u64, (u64, u64)), primary: (u64, (u64, u64))) -> Option<StackingPlan> {
+    let (overlay_zpos, overlay_range) = overlay;
+    let (primary_zpos, primary_range) = primary;
+
+    // Already above: touching either plane would only risk the commit.
+    if overlay_zpos > primary_zpos {
+        return None;
+    }
+    // Room above the primary inside the overlay's own range.
+    if overlay_range.1 > primary_zpos {
+        return Some(StackingPlan {
+            overlay: primary_zpos + 1,
+            primary: None,
+        });
+    }
+    // The overlay cannot reach any higher: move the primary down one instead,
+    // which needs the primary's own range to allow it.
+    let primary_can_move = primary_range.0 != primary_range.1 && primary_zpos > primary_range.0;
+    if primary_can_move {
+        return Some(StackingPlan {
+            overlay: overlay_range.1,
+            primary: Some(primary_zpos - 1),
+        });
+    }
+    None
+}
+
+/// Program the z-order so `granted` sits above the primary. Best effort: a
+/// failure only means the plane may be occluded, and the grant is worth having
+/// either way.
+fn raise_plane_above_primary(card: &DrmCard, granted: plane::Handle) -> io::Result<()> {
+    let Some(primary) = primary_plane(card)? else {
+        return Ok(());
+    };
+    let Some((overlay_prop, overlay_zpos, overlay_range)) = zpos(card, granted) else {
+        debug!("card{}: no zpos property, nothing to raise", card.index);
+        return Ok(());
+    };
+    let Some((primary_prop, primary_zpos, primary_range)) = zpos(card, primary) else {
+        return Ok(());
+    };
+
+    let Some(plan) = stacking_plan((overlay_zpos, overlay_range), (primary_zpos, primary_range))
+    else {
+        return Ok(());
+    };
+
+    let mut request = AtomicModeReq::new();
+    if let Some(value) = plan.primary {
+        request.add_property(primary, primary_prop, property::Value::UnsignedRange(value));
+    }
+    request.add_property(
+        granted,
+        overlay_prop,
+        property::Value::UnsignedRange(plan.overlay),
+    );
+
+    // ALLOW_MODESET because a z-order change is a modeset-shaped change on some
+    // drivers; sun4i accepts it without, and vc4 does not offer it at all
+    // (immutable zpos), which the plan above already accounts for.
+    card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, request)?;
+    info!(
+        "card{}: overlay plane {} zpos {overlay_zpos} -> {} (primary zpos {primary_zpos}{})",
+        card.index,
+        u32::from(granted),
+        plan.overlay,
+        plan.primary
+            .map(|value| format!(" -> {value}"))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// Program a plane off the pipeline. A dropped grant is not a cleared plane:
+/// the plane state holds its own reference to the framebuffer, so the last
+/// frame keeps scanning out until something programs that plane again — and
+/// once the grant holder is gone, only the master can.
+fn clear_plane(card: &DrmCard, plane: plane::Handle, crtc: crtc::Handle) {
+    if let Err(e) = card.set_plane(plane, crtc, None, 0, (0, 0, 0, 0), (0, 0, 0, 0)) {
+        warn!(
+            "card{}: failed to clear plane {}: {e}",
+            card.index,
+            u32::from(plane)
+        );
+    }
+}
+
+/// The card's leaseable objects as `RawResourceHandle`s, queried fresh: every
+/// CRTC, every display connector (writeback connectors are capture-only and
+/// cannot present a display) and every plane the clients may use.
+///
+/// # What the lease deliberately leaves out
+///
+/// Cursor planes. A lease is the only thing that can keep a client away from a
+/// plane, so the server's pointer plane is kept out of it: on a card that has
+/// cursor planes (vc4, for one) a client holding the lease could otherwise
+/// reprogram the server's pointer. A driver that reports no plane type, or a
+/// plane whose type cannot be read, stays in the lease — the status quo is
+/// "your own planes", and guessing wrong would silently take planes away.
+///
+/// The same mechanism is how the server reserves any plane for itself: leave
+/// it out of the object list.
 fn lease_objects(card: &DrmCard) -> io::Result<Vec<RawResourceHandle>> {
     let handles = card.resource_handles()?;
     let planes = card.plane_handles()?;
 
     let connectors = display_connectors(card, &handles);
 
-    let mut objects: Vec<RawResourceHandle> = handles
-        .crtcs
-        .iter()
-        .copied()
-        .map(RawResourceHandle::from)
-        .chain(connectors.iter().copied().map(RawResourceHandle::from))
-        .chain(planes.iter().copied().map(RawResourceHandle::from))
-        .collect();
+    let mut objects: Vec<RawResourceHandle> = Vec::new();
+    objects.extend(handles.crtcs.iter().copied().map(RawResourceHandle::from));
+    objects.extend(connectors.iter().copied().map(RawResourceHandle::from));
+    for plane in planes {
+        match plane_kind(card, plane) {
+            Some(PlaneKind::Cursor) => {
+                debug!(
+                    "card{}: keeping cursor plane {} with the server",
+                    card.index,
+                    u32::from(plane)
+                );
+            }
+            _ => objects.push(RawResourceHandle::from(plane)),
+        }
+    }
     objects.shrink_to_fit();
     Ok(objects)
+}
+
+/// The kinds of plane the server distinguishes, from the plane's immutable
+/// `type` property. `None` when the driver reports no type (or reading it
+/// failed): an unknown plane is treated as usable rather than withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaneKind {
+    Primary,
+    Overlay,
+    Cursor,
+}
+
+fn plane_kind(card: &DrmCard, plane: plane::Handle) -> Option<PlaneKind> {
+    let properties = card.get_properties(plane).ok()?;
+    for (handle, raw) in properties {
+        let info = card.get_property(handle).ok()?;
+        if info.name().to_bytes() != b"type" {
+            continue;
+        }
+        let property::ValueType::Enum(values) = info.value_type() else {
+            return None;
+        };
+        let name = values
+            .get_value_from_raw_value(raw)?
+            .name()
+            .to_bytes()
+            .to_vec();
+        return match name.as_slice() {
+            b"Primary" => Some(PlaneKind::Primary),
+            b"Overlay" => Some(PlaneKind::Overlay),
+            b"Cursor" => Some(PlaneKind::Cursor),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Open every DRM card that can present a display and register it as
@@ -321,7 +899,7 @@ pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>
     for index in indices {
         let path = PathBuf::from(format!("/dev/dri/card{index}"));
 
-        let card = match DrmCard::open(&path) {
+        let card = match DrmCard::open(&path, index) {
             Ok(card) => card,
             Err(e) => {
                 error!("Failed to open {}: {e}", path.display());
@@ -346,6 +924,12 @@ pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>
         };
 
         let connectors = display_connectors(&card, &handles);
+        if !connectors.is_empty() {
+            // Only a card that can present a display needs planes to program:
+            // warning about a render node (v3d, panfrost) would be noise about
+            // a card the server is about to drop.
+            card.enable_plane_capabilities();
+        }
         let any_connected = connectors.iter().any(|handle| {
             card.get_connector(*handle, false)
                 .is_ok_and(|info| info.state() == connector::State::Connected)
@@ -410,4 +994,75 @@ fn display_connectors(card: &DrmCard, handles: &ResourceHandles) -> Vec<connecto
 fn card_index(path: &Path) -> Option<u8> {
     let name = path.file_name()?.to_str()?;
     name.strip_prefix("card")?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StackingPlan;
+    use super::stacking_plan;
+
+    /// A driver that declares zpos mutable over the whole stack (sun4i: 0..2
+    /// over primary + two overlays).
+    const MUTABLE: (u64, u64) = (0, 2);
+    /// vc4: the primary's zpos is immutable, the overlays carry fixed values.
+    const IMMUTABLE: (u64, u64) = (0, 0);
+
+    #[test]
+    fn an_overlay_already_above_the_primary_is_not_touched() {
+        // Naming either plane in a commit can fail the commit on a driver whose
+        // zpos is immutable, so "nothing to do" has to mean "name nothing".
+        assert_eq!(stacking_plan((2, MUTABLE), (1, MUTABLE)), None);
+    }
+
+    #[test]
+    fn an_overlay_below_the_primary_moves_just_above_it() {
+        // The overlay has room: it moves, the primary stays out of the commit.
+        assert_eq!(
+            stacking_plan((0, MUTABLE), (1, MUTABLE)),
+            Some(StackingPlan {
+                overlay: 2,
+                primary: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_primary_pinned_at_the_top_makes_room_by_moving_down() {
+        // Overlay and primary both at the top of the range: the overlay cannot
+        // climb, so the primary steps down one.
+        assert_eq!(
+            stacking_plan((1, MUTABLE), (2, MUTABLE)),
+            Some(StackingPlan {
+                overlay: 2,
+                primary: Some(1)
+            })
+        );
+    }
+
+    #[test]
+    fn an_immutable_zpos_is_never_programmed() {
+        assert_eq!(stacking_plan((0, IMMUTABLE), (0, IMMUTABLE)), None);
+    }
+
+    #[test]
+    fn a_primary_that_cannot_move_leaves_the_overlay_alone() {
+        // The overlay's range tops out at the primary's position, and the
+        // primary's zpos is immutable: nothing can be programmed.
+        assert_eq!(stacking_plan((1, (1, 1)), (1, IMMUTABLE)), None);
+    }
+
+    #[test]
+    fn a_drivers_default_stack_needs_no_commit() {
+        // The H618's default: overlay 0, primary 1, overlay 2 — the granted
+        // plane is picked by z-position, so the top overlay needs no commit at
+        // all and the bottom one moves to just above the primary.
+        assert_eq!(stacking_plan((2, MUTABLE), (1, MUTABLE)), None);
+        assert_eq!(
+            stacking_plan((0, MUTABLE), (1, MUTABLE)),
+            Some(StackingPlan {
+                overlay: 2,
+                primary: None
+            })
+        );
+    }
 }

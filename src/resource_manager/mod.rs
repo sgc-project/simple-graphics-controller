@@ -20,6 +20,7 @@ mod fbdev;
 pub mod hotplug;
 #[cfg(feature = "input")]
 mod input;
+mod overlay_policy;
 
 // Both are only used by the debug/test-only consistency checker below: a release
 // build does not compile it, and then has no use for them.
@@ -29,8 +30,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::types::ClientId;
 use dashmap::DashMap;
-use simple_graphics_protocol::{PlaneRole, Resource};
+use simple_graphics_protocol::{DrmGrant, PlaneRole, Resource};
 
 use crate::types::ResourceRegistry;
 // as above: only the consistency checker (and its tests) name this type
@@ -66,6 +68,16 @@ pub struct Inventory {
     inputs: InputIndex,
 }
 
+/// What a grant consists of: the fd to hand the client, and — for a DRM
+/// plane — which plane the server chose for it.
+#[derive(Debug)]
+pub struct Granted {
+    /// The fd the client receives over `SCM_RIGHTS`.
+    pub fd: OwnedFd,
+    /// The plane to draw on, when the resource is a DRM card.
+    pub drm: Option<DrmGrant>,
+}
+
 impl Inventory {
     /// The grant sources, with no input devices behind them. The daemon always
     /// goes through `open_resources()`; this is how a test builds a server's
@@ -92,56 +104,112 @@ impl Inventory {
         }
     }
 
-    /// The fd to grant for one resource: a fresh lease for a card's PRIMARY
-    /// plane, otherwise a dup of the registered fd.
+    /// The fd to grant for one resource, and what to draw on: a card's PRIMARY
+    /// role creates (or reuses) the pipeline's lease, its OVERLAY role takes a
+    /// plane of the running pipeline — through that same lease, since a lease
+    /// is the only handle a client can program a plane with. Anything else is
+    /// a dup of the registered fd.
     ///
-    /// The overlay role of a card is not granted yet: the lease this server
-    /// creates carries the primary planes only, so there is nothing to hand a
-    /// client that asks for an overlay. The request is refused (see
-    /// `handle_acquire`, which logs and denies before it gets here) and this
-    /// arm is what makes the refusal total.
-    pub fn grant_fd(&self, resource: &Resource) -> anyhow::Result<OwnedFd> {
+    /// `client` is what makes the overlay grant an ownership: the plane stays
+    /// with this client until it releases the resource or disconnects.
+    pub fn grant_fd(&self, resource: &Resource, client: ClientId) -> anyhow::Result<Granted> {
         match resource {
             #[cfg(feature = "drm")]
-            Resource::Drm { card, plane } => match plane {
-                PlaneRole::Primary => {
-                    let device = self.drm.get(resource).ok_or_else(|| {
-                        anyhow::anyhow!("resource {resource:?} is not registered")
-                    })?;
-                    device
-                        .grant_lease()
-                        .map_err(|e| anyhow::anyhow!("failed to lease {resource:?}: {e}"))
+            Resource::Drm { plane, .. } => {
+                let device = self
+                    .drm_device(resource)
+                    .ok_or_else(|| anyhow::anyhow!("card of {resource:?} is not registered"))?;
+
+                match plane {
+                    PlaneRole::Primary => device
+                        .grant_lease(client)
+                        .map(|fd| Granted { fd, drm: None })
+                        .map_err(|e| anyhow::anyhow!("failed to lease {resource:?}: {e}")),
+                    PlaneRole::Overlay => {
+                        // The plane is chosen first (it is what the request is
+                        // for and what can refuse), then the lease fd it is
+                        // programmed through. A failure to dup that fd takes
+                        // the plane back, so a refused request cannot leave a
+                        // plane assigned to nobody.
+                        let drm = device
+                            .grant_overlay(client)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        match device.lease_fd() {
+                            Ok(fd) => Ok(Granted { fd, drm: Some(drm) }),
+                            Err(e) => {
+                                device.release_overlay(client);
+                                Err(anyhow::anyhow!("failed to grant {resource:?}: {e}"))
+                            }
+                        }
+                    }
                 }
-                PlaneRole::Overlay => Err(anyhow::anyhow!(
-                    "overlay planes are not granted yet (card {card}: this server leases the \
-                     primary plane only)"
-                )),
-            },
+            }
             _ => self
                 .fds
                 .get(resource)
                 .ok_or_else(|| anyhow::anyhow!("resource {resource:?} is not registered"))?
                 .try_clone()
+                .map(|fd| Granted { fd, drm: None })
                 .map_err(|e| anyhow::anyhow!("failed to dup fd for {resource:?}: {e}")),
         }
     }
 
-    /// Give up a `Drm` lease now, so the resource is free for the next grant
-    /// whatever the client does with the fd it was handed.
-    pub fn revoke_lease(&self, resource: &Resource) {
+    /// The device behind any DRM resource of a card, whatever role it names.
+    ///
+    /// The registry is keyed by the resource a client acquires, and the DRM
+    /// resource that is registered is the card's PRIMARY plane — one entry per
+    /// card, one device behind it. An overlay resource is the same card's, so
+    /// it resolves through the card rather than by its own key, which is how a
+    /// lookup by the overlay's own resource would find nothing.
+    #[cfg(feature = "drm")]
+    fn drm_device(
+        &self,
+        resource: &Resource,
+    ) -> Option<dashmap::mapref::one::Ref<'_, Resource, drm::DrmDevice>> {
+        let Resource::Drm { card, .. } = resource else {
+            return None;
+        };
+        self.drm.get(&Resource::drm(*card))
+    }
+
+    /// Everything `client` held that the policy engine does not know about —
+    /// and the pipeline it owned.
+    ///
+    /// The engine cleans up after itself on disconnect (it tracks the resources
+    /// it granted), but an overlay grant never went through it, so without this
+    /// a killed client would leave its plane granted to nobody, still scanning
+    /// out its last frame. And a lease outliving its owner is worse than a
+    /// leak: the CRTC keeps its mode, so the pipeline still looks alive and the
+    /// next overlay request would be granted a plane of a display nobody is
+    /// driving.
+    pub fn release_client(&self, client: ClientId) {
         #[cfg(feature = "drm")]
-        if matches!(
-            resource,
-            Resource::Drm {
-                plane: PlaneRole::Primary,
-                ..
-            }
-        ) && let Some(device) = self.drm.get(resource)
-        {
-            device.revoke_lease();
+        for device in self.drm.iter() {
+            device.release_overlay(client);
+            device.revoke_lease_if_owned_by(client);
         }
         #[cfg(not(feature = "drm"))]
-        let _ = resource;
+        let _ = client;
+    }
+
+    /// Give up what a resource holds, now.
+    ///
+    /// A PRIMARY release revokes the lease — kernel-enforced, and every
+    /// overlay grant of that pipeline goes with it. An OVERLAY release frees
+    /// only its plane: the pipeline belongs to the client still on the
+    /// display, and that client keeps drawing.
+    pub fn revoke_lease(&self, resource: &Resource, client: ClientId) {
+        #[cfg(feature = "drm")]
+        if let Resource::Drm { plane, .. } = resource
+            && let Some(device) = self.drm_device(resource)
+        {
+            match plane {
+                PlaneRole::Primary => device.revoke_lease(),
+                PlaneRole::Overlay => device.release_overlay(client),
+            }
+        }
+        #[cfg(not(feature = "drm"))]
+        let _ = (resource, client);
     }
 }
 
