@@ -560,22 +560,44 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry, engine: crate::windowing:
             // invisible next to a visible hitch once a second.
             if last_discovery.elapsed() >= std::time::Duration::from_secs(5) {
                 last_discovery = std::time::Instant::now();
-                for (path, device) in evdev::enumerate() {
-                    if device.supported_relative_axes().iter().next().is_some() {
-                        // Non-blocking, and this is not an optimisation:
-                        // `fetch_events` reads until EAGAIN, so on a blocking fd
-                        // the read after the last queued event never returns —
-                        // the reader would sit in the kernel forever, having
-                        // handled one batch and drawn nothing.
-                        if !make_nonblocking(&device) {
-                            continue;
+                // Exactly one pointer, chosen deliberately. A wireless receiver
+                // can expose the same mouse through two interfaces (this board:
+                // "USB Receiver" and "USB Dongle", both with REL_X/Y and
+                // BTN_LEFT), and the HDMI receivers expose REL_X/Y for their IR
+                // remotes. Integrating every relative device moves the cursor
+                // once per interface: it overshoots the hand, fights itself, and
+                // pins at the edges. One pointer, one sum.
+                let chosen = evdev::enumerate()
+                    .filter(|(_, device)| {
+                        let axes = device.supported_relative_axes().unwrap_or_default();
+                        axes.contains(evdev::RelativeAxisType::REL_X)
+                            && axes.contains(evdev::RelativeAxisType::REL_Y)
+                            && device
+                                .supported_keys()
+                                .is_some_and(|keys| keys.contains(evdev::Key::BTN_LEFT))
+                    })
+                    .min_by(|(left, _), (right, _)| left.cmp(right));
+
+                match chosen {
+                    Some((path, device)) if make_nonblocking(&device) => {
+                        if !devices.contains_key(&path) {
+                            tracing::info!(
+                                "pointer: reading {} ({})",
+                                path.display(),
+                                device.name().unwrap_or("unnamed")
+                            );
+                            // The chosen pointer changed: whatever was being read
+                            // before is not the pointer any more.
+                            devices.clear();
                         }
-                        // `or_insert`: a device already being read keeps its
-                        // position in the queue; a new one starts here.
-                        devices.entry(path).or_insert(device);
+                        devices.insert(path, device);
+                    }
+                    _ => {
+                        // No pointer at all (unplugged): read nothing rather than
+                        // fall back to something that is not a pointer.
+                        devices.clear();
                     }
                 }
-                devices.retain(|path, _| path.exists());
             }
 
             // Wake at least once a second: the rediscovery above must run even
@@ -592,15 +614,47 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry, engine: crate::windowing:
             let _ = nix::poll::poll(&mut fds, 1000u16);
 
             let mut moved = false;
+            // How much arrived in this wake, and whether the kernel admits to
+            // having dropped some of it. A fast flick after an idle period is
+            // exactly when an evdev queue overflows, and a dropped burst is felt
+            // as "the pointer moved a little instead of where I sent it".
+            let mut batch = 0usize;
+            let mut dropped = false;
             for device in devices.values_mut() {
-                let Ok(events) = device.fetch_events() else {
-                    continue;
-                };
-                for event in events {
-                    if pointer.handle(event.event_type(), event.code(), event.value()) {
-                        moved = true;
+                // Drain the device until it is empty. `fetch_events` is a single
+                // `read()` of at most one batch, and a fast flick queues several:
+                // committing after each batch is what makes the pointer trail the
+                // hand and stop short, because the last batch is read after the
+                // draw. Everything pending goes in before anything is drawn.
+                loop {
+                    let Ok(events) = device.fetch_events() else {
+                        break;
+                    };
+                    let mut read = 0usize;
+                    for event in events {
+                        read += 1;
+                        if event.event_type() == evdev::EventType::SYNCHRONIZATION
+                            && event.code() == 3
+                        {
+                            dropped = true;
+                        }
+                        if pointer.handle(event.event_type(), event.code(), event.value()) {
+                            moved = true;
+                        }
+                    }
+                    batch += read;
+                    if read == 0 {
+                        break;
                     }
                 }
+            }
+            if dropped {
+                tracing::warn!(
+                    "pointer: the kernel dropped events (SYN_DROPPED) — that movement is lost"
+                );
+            }
+            if batch > 0 {
+                tracing::debug!("pointer batch: {batch} events at {:?}", pointer.position());
             }
             // The clamp belongs to the display, which belongs to a card — but the
             // answer does not change between frames, so it is cached and only
