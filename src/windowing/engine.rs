@@ -115,7 +115,10 @@ enum EngineCommand {
     },
     /// The controller's pointer moved. Routed through the engine because the
     /// engine is what knows who holds the display.
-    Pointer { x: i32, y: i32 },
+    Pointer {
+        x: i32,
+        y: i32,
+    },
     /// The device behind `resource` is gone. Its holder keeps the resource (no
     /// revoke, no re-acquire when it returns).
     Suspend {
@@ -556,7 +559,9 @@ fn handle_command(
                 .iter()
                 .find(|(resource, slot)| is_display(resource) && slot.owner.is_some())
                 .and_then(|(_, slot)| slot.owner);
-            match target.and_then(|client| control_reg.get(&client).map(|control| (client, control))) {
+            match target
+                .and_then(|client| control_reg.get(&client).map(|control| (client, control)))
+            {
                 Some((client, control)) => {
                     let _ = control.send(ControlMessage::Pointer { x, y });
                     tracing::trace!("pointer {x},{y} to client {client}");

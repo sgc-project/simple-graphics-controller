@@ -776,29 +776,28 @@ impl DrmDevice {
     ///
     /// No pipeline means no cursor: there is nothing on screen to point at, and
     /// a plane commit on a CRTC with no mode would be refused anyway.
-    pub fn show_cursor(&self, shape: CursorShape, position: (i32, i32)) {
+    /// Draw the pointer at `position` with `shape`, on this card's pipeline.
+    ///
+    /// `mode` is passed in because the caller already knows it: the steady-state
+    /// path must be one `set_plane` and nothing else. Re-asking the pipeline for
+    /// its CRTC and mode costs three ioctls, and at pointer rates that is enough
+    /// competing traffic with the app's own commits to make the cursor stutter.
+    pub fn show_cursor(&self, shape: CursorShape, position: (i32, i32), mode: (u32, u32)) {
         // Lock order: the card state, then the cursor surface. Never the other
         // way round.
         let state = self.state.lock().unwrap();
         let DrmDeviceState::Leased(dev) = state.as_ref().expect("state always present") else {
             return;
         };
-        let Some((crtc, _)) = live_pipeline(&dev.card) else {
-            return;
-        };
-        let Some(mode) = dev.card.get_crtc(crtc).ok().and_then(|info| info.mode()) else {
-            return;
-        };
-        let mode = (mode.size().0 as u32, mode.size().1 as u32);
 
         let mut guard = self.cursor_surface.lock().unwrap();
-        // A different pipeline (a new CRTC after a handover) needs a new sprite:
-        // a plane belongs to one CRTC.
-        if guard.as_ref().is_some_and(|surface| surface.crtc() != crtc) {
-            *guard = None;
-        }
         let first = guard.is_none();
         if first {
+            // Picking a plane is the one thing that needs the pipeline, and it
+            // happens once per pipeline, not once per move.
+            let Some((crtc, _)) = live_pipeline(&dev.card) else {
+                return;
+            };
             // The CRTC's own cursor plane first: it is the server's alone
             // (`lease_objects` keeps every cursor plane out of every lease) and
             // sits above the primary by construction, so it costs a client no
@@ -857,10 +856,16 @@ impl DrmDevice {
                 self.index
             ),
             Ok(()) => debug!("card{}: cursor moved to {position:?}", self.index),
-            Err(e) => warn!(
-                "card{}: could not draw the cursor at {position:?}: {e}",
-                self.index
-            ),
+            Err(e) => {
+                // The pipeline moved under the surface (a new CRTC, or a new
+                // pipeline): forget it, so the next draw picks a plane again
+                // rather than committing into a dead one forever.
+                *guard = None;
+                warn!(
+                    "card{}: could not draw the cursor at {position:?}: {e}",
+                    self.index
+                );
+            }
         }
     }
 
@@ -873,10 +878,15 @@ impl DrmDevice {
         let Some(position) = *self.cursor_position.lock().unwrap() else {
             return;
         };
+        // Rare path (a shape change, not a move), so asking the pipeline for the
+        // mode here costs nothing.
+        let Some(mode) = self.pipeline_mode() else {
+            return;
+        };
         match self.cursor_shape() {
             Some(request) if !request.visible => self.hide_cursor(),
-            Some(request) => self.show_cursor(request.shape, position),
-            None => self.show_cursor(CursorShape::Default, position),
+            Some(request) => self.show_cursor(request.shape, position, mode),
+            None => self.show_cursor(CursorShape::Default, position, mode),
         }
     }
 

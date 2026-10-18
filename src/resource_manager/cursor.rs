@@ -53,10 +53,6 @@ impl CursorSurface {
         self.plane
     }
 
-    pub(crate) fn crtc(&self) -> crtc::Handle {
-        self.crtc
-    }
-
     /// Draw `shape` with its hotspot on `position` (the pointer), clamped into
     /// `mode`: an overlay neither wraps nor scales, so half a sprite would
     /// simply not appear near an edge.
@@ -160,7 +156,6 @@ mod tests {
         assert!(!surface.visible);
         assert!(surface.shape.is_none());
         assert!(surface.fb.is_none());
-        assert_eq!(u32::from(surface.crtc()), 94);
     }
 
     /// A loaded shape is remembered, which is what stops `show_at` from

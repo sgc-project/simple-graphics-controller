@@ -540,6 +540,13 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry, engine: crate::windowing:
         let mut pointer = pointer::Pointer::new((0, 0));
         let mut devices: HashMap<std::path::PathBuf, evdev::Device> = HashMap::new();
         let mut last_discovery = std::time::Instant::now();
+        // The pipeline's mode, cached. Querying it costs a state lock and three
+        // DRM ioctls (resource handles, the CRTC, its mode) — per motion batch
+        // that is hundreds of ioctls a second competing with the app's own
+        // commits, and the cursor visibly stutters. A pipeline change moves the
+        // mode, and a second of staleness on a fresh one costs nothing.
+        let mut cached_mode: Option<(u32, u32)> = None;
+        let mut mode_checked = std::time::Instant::now() - std::time::Duration::from_secs(2);
         // The mode the cursor was last drawn on. A new pipeline (the first
         // client, a resume) draws the cursor at once instead of waiting for the
         // user to move the mouse: an invisible cursor on a fresh screen looks
@@ -547,7 +554,11 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry, engine: crate::windowing:
         let mut drawn_on: Option<(u32, u32)> = None;
 
         loop {
-            if last_discovery.elapsed() >= std::time::Duration::from_secs(1) {
+            // Hotplug is not a per-frame concern: enumerating /dev/input opens
+            // every device and reads its capabilities, which on this thread is a
+            // stall the cursor feels. Five seconds of latency on a plug-in is
+            // invisible next to a visible hitch once a second.
+            if last_discovery.elapsed() >= std::time::Duration::from_secs(5) {
                 last_discovery = std::time::Instant::now();
                 for (path, device) in evdev::enumerate() {
                     if device.supported_relative_axes().iter().next().is_some() {
@@ -591,11 +602,19 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry, engine: crate::windowing:
                     }
                 }
             }
-            // The clamp belongs to the display, which belongs to a card.
-            let mut mode = None;
-            for card in drm.iter() {
-                mode = card.pipeline_mode().or(mode);
+            // The clamp belongs to the display, which belongs to a card — but the
+            // answer does not change between frames, so it is cached and only
+            // re-asked once a second (or when there is no cursor at all).
+            if cached_mode.is_none() || mode_checked.elapsed() >= std::time::Duration::from_secs(1)
+            {
+                mode_checked = std::time::Instant::now();
+                let mut mode = None;
+                for card in drm.iter() {
+                    mode = card.pipeline_mode().or(mode);
+                }
+                cached_mode = mode;
             }
+            let mode = cached_mode;
             let Some(mode) = mode else {
                 // No pipeline: forget what the cursor was drawn on, so the next
                 // one draws at once even if it uses the same mode.
@@ -623,14 +642,26 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry, engine: crate::windowing:
             // way its idea of the pointer cannot drift from the drawn cursor —
             // two integrators clamping at an edge lose different deltas.
             engine.pointer(position.0, position.1);
+            // A commit that takes longer than a frame is why a cursor feels
+            // sticky, and it is invisible unless something says so.
+            let commit_started = std::time::Instant::now();
             for card in drm.iter() {
                 match card.cursor_shape() {
                     Some(request) if !request.visible => card.hide_cursor(),
-                    Some(request) => card.show_cursor(request.shape, position),
-                    None => {
-                        card.show_cursor(simple_graphics_protocol::CursorShape::Default, position)
-                    }
+                    Some(request) => card.show_cursor(request.shape, position, mode),
+                    None => card.show_cursor(
+                        simple_graphics_protocol::CursorShape::Default,
+                        position,
+                        mode,
+                    ),
                 }
+            }
+            let commit = commit_started.elapsed();
+            if commit > std::time::Duration::from_millis(2) {
+                tracing::debug!(
+                    "cursor commit at {position:?} took {} us",
+                    commit.as_micros()
+                );
             }
         }
     });
