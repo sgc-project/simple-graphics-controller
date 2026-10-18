@@ -532,7 +532,7 @@ mod tests {
 /// the set is rediscovered every second so a device plugged in later is picked
 /// up and an unplugged one is dropped. Absolute devices are out of scope until
 /// the projection work gives them an axis range to map.
-pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry) {
+pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry, engine: crate::windowing::PolicyEngine) {
     use std::collections::HashMap;
     use std::os::fd::AsRawFd;
 
@@ -618,6 +618,11 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry) {
             pointer.set_mode(mode);
             drawn_on = Some(mode);
             let position = pointer.position();
+            // One integrator, one truth: the app on the display is told where
+            // the pointer is rather than summing deltas itself, which is the only
+            // way its idea of the pointer cannot drift from the drawn cursor —
+            // two integrators clamping at an edge lose different deltas.
+            engine.pointer(position.0, position.1);
             for card in drm.iter() {
                 match card.cursor_shape() {
                     Some(request) if !request.visible => card.hide_cursor(),

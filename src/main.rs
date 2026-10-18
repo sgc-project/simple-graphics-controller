@@ -36,7 +36,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting simple-graphics-controller");
     let (inventory, advertised) = open_resources();
-    spawn_pointer_tracking(inventory.drm_registry());
 
     info!("{}", resource_manager::cursor_art_summary());
     // Advertised list: shared and mutable, because the input reconciler adds
@@ -64,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
         .map(|resource| (resource, policy))
         .collect();
     let engine = PolicyEngine::spawn(policies);
+    // After the engine: the pointer reader reports every move to it, and it is
+    // the engine that knows which client holds the display.
+    spawn_pointer_tracking(inventory.drm_registry(), engine.clone());
 
     // Input devices are not a boot-time snapshot: adopt the ones plugged in
     // while the server runs, and suspend the ones that go away. Resources

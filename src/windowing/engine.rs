@@ -31,6 +31,9 @@ pub enum ControlMessage {
     /// The client is granted (after being queued or requeued): write
     /// `ServerMessage::Grant` with the matching fd on the wire.
     Grant { resource: Resource },
+    /// Where the controller's pointer is. Written to the app on the display
+    /// only — the one client that acts on hover.
+    Pointer { x: i32, y: i32 },
     /// The server's resource list changed (a device appeared or went away):
     /// write `ServerMessage::Advertise` with the current list. Server-level
     /// state rather than ownership, routed through the engine because the
@@ -110,6 +113,9 @@ enum EngineCommand {
         client: ClientId,
         resource: Resource,
     },
+    /// The controller's pointer moved. Routed through the engine because the
+    /// engine is what knows who holds the display.
+    Pointer { x: i32, y: i32 },
     /// The device behind `resource` is gone. Its holder keeps the resource (no
     /// revoke, no re-acquire when it returns).
     Suspend {
@@ -190,6 +196,15 @@ impl PolicyEngine {
     }
 
     /// Put `resource` into `client`'s hands with an ordinary Grant.
+    /// Tell the engine where the controller's pointer is.
+    ///
+    /// Called from the pointer reader, which is a plain thread, so this is a
+    /// non-blocking send: a full queue means the actor is behind, and a dropped
+    /// position costs a moment of stale hover rather than a stalled cursor.
+    pub fn pointer(&self, x: i32, y: i32) {
+        let _ = self.tx.try_send(EngineCommand::Pointer { x, y });
+    }
+
     pub async fn grant_to(&self, client: ClientId, resource: Resource) {
         let _ = self
             .tx
@@ -532,6 +547,22 @@ fn handle_command(
         EngineCommand::Register { client, control } => {
             control_reg.insert(client, control);
             debug!("[client {client}] registered with policy engine");
+        }
+        EngineCommand::Pointer { x, y } => {
+            // The seat: whoever holds a display resource. A guest overlay is
+            // deliberately not told — it holds no input and must not believe it
+            // is being hovered.
+            let target = slots
+                .iter()
+                .find(|(resource, slot)| is_display(resource) && slot.owner.is_some())
+                .and_then(|(_, slot)| slot.owner);
+            match target.and_then(|client| control_reg.get(&client).map(|control| (client, control))) {
+                Some((client, control)) => {
+                    let _ = control.send(ControlMessage::Pointer { x, y });
+                    tracing::trace!("pointer {x},{y} to client {client}");
+                }
+                None => tracing::trace!("pointer {x},{y}: no client is on the display"),
+            }
         }
         EngineCommand::GrantTo { client, resource } => match control_reg.get(&client) {
             Some(control) => {

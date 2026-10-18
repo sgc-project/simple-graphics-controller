@@ -37,6 +37,13 @@ pub(super) async fn process_control_message(
             let resp = serialize_framed(&ServerMessage::Revoke { resource })?;
             stream.write_all(&resp).await.map_err(ServerError::Write)?;
         }
+        ControlMessage::Pointer { x, y } => {
+            // Per-frame path: no log, no ack. The position is the controller's,
+            // clamped to the mode, so the app never integrates deltas itself and
+            // cannot drift from the drawn cursor.
+            let resp = serialize_framed(&ServerMessage::Pointer { x, y })?;
+            stream.write_all(&resp).await.map_err(ServerError::Write)?;
+        }
         ControlMessage::Advertise {
             available_resources,
         } => {
