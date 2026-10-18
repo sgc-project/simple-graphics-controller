@@ -76,15 +76,32 @@ impl CursorSurface {
         let y = (position.1 - art.hotspot.1).clamp(0, max_y);
 
         let fb = self.fb.expect("loaded above");
-        card.set_plane(
+        let committed = card.set_plane(
             self.plane,
             self.crtc,
             Some(fb),
-            0,
+            // Non-blocking. Without it the commit waits for vblank and behind
+            // whatever else is committing the same CRTC — measured at 12-66 ms
+            // under fast motion, i.e. the pointer standing still while the hand
+            // moves, then jumping. A cursor does not need to know when its commit
+            // lands; the kernel keeps the newest state and drops nothing.
+            drm::control::AtomicCommitFlags::NONBLOCK.bits(),
             (x, y, w, h),
             // Source rectangle in 16.16 fixed point: the whole sprite.
             (0, 0, w << 16, h << 16),
-        )?;
+        );
+        match committed {
+            Ok(()) => {}
+            // The previous commit has not landed yet. Not a failure: the kernel
+            // keeps the newest state, and the next mouse event is a few
+            // milliseconds away. Retrying here would only add latency.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(nix::libc::EBUSY) | Some(nix::libc::EAGAIN)
+                ) => {}
+            Err(e) => return Err(e),
+        }
         self.visible = true;
         Ok(())
     }
