@@ -505,6 +505,11 @@ pub struct DrmDevice {
     cursor_request: Mutex<Option<CursorRequest>>,
     /// The surface the controller draws the pointer on, once a pipeline exists.
     cursor_surface: Mutex<Option<CursorSurface>>,
+    /// Where the pointer was last drawn. A shape can change while the pointer
+    /// stands still (a drag starts, a button appears under it), and the tracker
+    /// only commits on motion — so the redraw after a shape change needs the
+    /// position from here, not from the reader.
+    cursor_position: Mutex<Option<(i32, i32)>>,
 }
 
 impl DrmDevice {
@@ -842,7 +847,11 @@ impl DrmDevice {
             *guard = Some(CursorSurface::new(plane, crtc));
         }
         let surface = guard.as_mut().expect("created above");
-        match surface.show_at(&dev.card, shape, position, mode) {
+        let drawn = surface.show_at(&dev.card, shape, position, mode);
+        if drawn.is_ok() {
+            *self.cursor_position.lock().unwrap() = Some(position);
+        }
+        match drawn {
             Ok(()) if first => info!(
                 "card{}: drawing the cursor at {position:?} (shape {shape:?}, mode {mode:?})",
                 self.index
@@ -852,6 +861,22 @@ impl DrmDevice {
                 "card{}: could not draw the cursor at {position:?}: {e}",
                 self.index
             ),
+        }
+    }
+
+    /// Redraw the pointer at the position it was last drawn at.
+    ///
+    /// A shape can change with the pointer standing still — a drag starts, a
+    /// control appears under it — and the tracker commits only on motion, so
+    /// without this the shape would stay stale until the user moved.
+    pub fn redraw_cursor(&self) {
+        let Some(position) = *self.cursor_position.lock().unwrap() else {
+            return;
+        };
+        match self.cursor_shape() {
+            Some(request) if !request.visible => self.hide_cursor(),
+            Some(request) => self.show_cursor(request.shape, position),
+            None => self.show_cursor(CursorShape::Default, position),
         }
     }
 
@@ -1405,6 +1430,7 @@ pub(super) fn open_devices(inventory: &Inventory, advertised: &mut Vec<Resource>
                 overlay_geometries: Mutex::new(HashMap::new()),
                 cursor_request: Mutex::new(None),
                 cursor_surface: Mutex::new(None),
+                cursor_position: Mutex::new(None),
             },
         );
         advertised.push(resource);

@@ -652,6 +652,14 @@ fn make_nonblocking(device: &evdev::Device) -> bool {
 }
 
 impl Inventory {
+    /// Redraw every card's pointer at the shape it now holds, at the position it
+    /// was last drawn at.
+    pub(crate) fn redraw_cursor(&self) {
+        for card in self.drm.iter() {
+            card.redraw_cursor();
+        }
+    }
+
     /// The cards, for the pointer reader (which outlives any one request).
     pub fn drm_registry(&self) -> DrmRegistry {
         self.drm.clone()

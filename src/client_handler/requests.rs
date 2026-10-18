@@ -56,13 +56,16 @@ pub(super) async fn dispatch_request(
             // The controller draws it, so this is a request for the art and the
             // visibility, not a claim on the cursor.
             match inventory.record_cursor_shape(client_id, shape, visible) {
-                // Recorded, not drawn yet: the renderer (pointer tracking plus
-                // the plane commit) lands next. The log must not claim more.
-                Some(request) => debug!(
-                    "[client {client_id} (pid {client_pid})] cursor: client {} wants {:?} \
-                     (visible {}) — recorded",
-                    request.client, request.shape, request.visible
-                ),
+                // The record drives the next draw; the redraw is explicit
+                // because a shape can change while the pointer stands still.
+                Some(request) => {
+                    debug!(
+                        "[client {client_id} (pid {client_pid})] cursor: client {} wants {:?} \
+                         (visible {}) — recorded",
+                        request.client, request.shape, request.visible
+                    );
+                    inventory.redraw_cursor();
+                }
                 None => debug!(
                     "[client {client_id} (pid {client_pid})] cursor shape ignored: not the \
                      display's owner"

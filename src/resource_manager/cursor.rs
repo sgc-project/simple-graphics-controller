@@ -131,6 +131,15 @@ impl CursorSurface {
         // transparent pixels black. 32/32 gives ARGB8888, which is what a cursor
         // needs. (A dumb buffer is linear by construction, so no modifier.)
         let fb = card.add_framebuffer(&buffer, 32, 32)?;
+        // The art actually loaded, with its framebuffer: the only place a shape
+        // becomes pixels, and the thing to look at when a shape "does not change".
+        tracing::debug!(
+            "cursor art loaded: {shape:?} ({}x{}, hotspot {:?}) as fb {}",
+            art.width,
+            art.height,
+            art.hotspot,
+            u32::from(fb)
+        );
         self.fb = Some(fb);
         self.buffer = Some(buffer);
         self.shape = Some(shape);
