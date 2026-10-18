@@ -297,7 +297,11 @@ impl LeasedDrmDevice {
     /// stacks several) gives up its topmost one first — the plane most likely
     /// to already sit above the primary. Idempotent, because a client asking
     /// again for what it holds must not be handed a second plane.
-    fn grant_overlay(&mut self, owner: ClientId) -> Result<DrmGrant, OverlayError> {
+    fn grant_overlay(
+        &mut self,
+        owner: ClientId,
+        cursor_plane: Option<plane::Handle>,
+    ) -> Result<DrmGrant, OverlayError> {
         let index = self.card.index;
 
         // The policy owns who gets the plane; this function owns how a plane is
@@ -344,9 +348,12 @@ impl LeasedDrmDevice {
 
         let io_error = |e: io::Error| OverlayError::Io(index, e);
         let (crtc, connector) = live_pipeline(&self.card).ok_or(OverlayError::NoPipeline(index))?;
+        // The cursor's plane is the controller's own: handing it to a client
+        // would take the pointer off the screen.
         let plane = overlay_candidates(&self.card, crtc)
             .map_err(io_error)?
             .into_iter()
+            .filter(|(plane, _)| Some(*plane) != cursor_plane)
             .max_by_key(|(_, zpos)| *zpos)
             .map(|(plane, _)| plane)
             .ok_or_else(|| OverlayError::NoFreePlane(index, u32::from(crtc)))?;
@@ -571,7 +578,7 @@ impl DrmDevice {
         // is no window in which another client could take it. It is told with
         // an ordinary Grant, so the client needs no special path for it.
         let overlay_regranted = match leased.overlay_hold.take() {
-            Some(holder) => match leased.grant_overlay(holder) {
+            Some(holder) => match leased.grant_overlay(holder, self.cursor_plane()) {
                 Ok(grant) => {
                     info!(
                         "card{}: overlay plane {} (crtc {}) re-granted to client {holder} \
@@ -618,6 +625,8 @@ impl DrmDevice {
     /// [`Self::lease_fd`] hands out that dup. A card nobody holds has no
     /// pipeline, and no pipeline has no planes to put on screen.
     pub fn grant_overlay(&self, owner: ClientId) -> Result<DrmGrant, OverlayError> {
+        // Read before the state lock: the order is state, then cursor surface.
+        let cursor_plane = self.cursor_plane();
         let mut guard = self.state.lock().unwrap();
         let current = guard.take().expect("state always present");
 
@@ -627,7 +636,7 @@ impl DrmDevice {
                 Err(OverlayError::NoPipeline(self.index)),
             ),
             DrmDeviceState::Leased(mut dev) => {
-                let result = dev.grant_overlay(owner);
+                let result = dev.grant_overlay(owner, cursor_plane);
                 (DrmDeviceState::Leased(dev), result)
             }
         };
@@ -717,6 +726,15 @@ impl DrmDevice {
         *self.cursor_request.lock().unwrap()
     }
 
+    /// The plane the cursor is drawn on, if it is drawn at all.
+    fn cursor_plane(&self) -> Option<plane::Handle> {
+        self.cursor_surface
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(CursorSurface::plane)
+    }
+
     /// What the display owner asked the cursor to look like, if it asked.
     pub fn cursor_shape(&self) -> Option<CursorRequest> {
         *self.cursor_request.lock().unwrap()
@@ -728,10 +746,24 @@ impl DrmDevice {
     pub fn pipeline_mode(&self) -> Option<(u32, u32)> {
         let guard = self.state.lock().unwrap();
         let DrmDeviceState::Leased(dev) = guard.as_ref().expect("state always present") else {
+            tracing::debug!("card{}: not leased — no cursor", self.index);
             return None;
         };
-        let (crtc, _) = live_pipeline(&dev.card)?;
-        let mode = dev.card.get_crtc(crtc).ok()?.mode()?;
+        let Some((crtc, _)) = live_pipeline(&dev.card) else {
+            tracing::debug!("card{}: no CRTC reports a mode", self.index);
+            return None;
+        };
+        let info = match dev.card.get_crtc(crtc) {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::debug!("card{}: get_crtc {crtc:?}: {e}", self.index);
+                return None;
+            }
+        };
+        let Some(mode) = info.mode() else {
+            tracing::debug!("card{}: crtc {crtc:?} reports no mode", self.index);
+            return None;
+        };
         Some((mode.size().0 as u32, mode.size().1 as u32))
     }
 
@@ -749,13 +781,77 @@ impl DrmDevice {
         let Some((crtc, _)) = live_pipeline(&dev.card) else {
             return;
         };
+        let Some(mode) = dev.card.get_crtc(crtc).ok().and_then(|info| info.mode()) else {
+            return;
+        };
+        let mode = (mode.size().0 as u32, mode.size().1 as u32);
+
         let mut guard = self.cursor_surface.lock().unwrap();
-        let surface = guard.get_or_insert_with(|| CursorSurface::new(crtc));
-        if let Err(e) = surface.show_at(&dev.card, shape, position) {
-            warn!(
+        // A different pipeline (a new CRTC after a handover) needs a new sprite:
+        // a plane belongs to one CRTC.
+        if guard.as_ref().is_some_and(|surface| surface.crtc() != crtc) {
+            *guard = None;
+        }
+        let first = guard.is_none();
+        if first {
+            // The CRTC's own cursor plane first: it is the server's alone
+            // (`lease_objects` keeps every cursor plane out of every lease) and
+            // sits above the primary by construction, so it costs a client no
+            // plane and needs no zpos. A driver with none falls back to an
+            // overlay no client has been promised, which then has to be raised.
+            let (plane, raised) = match cursor_plane(&dev.card, crtc) {
+                Some(plane) => (Some(plane), false),
+                None => {
+                    let taken = dev.overlay.as_ref().map(|grant| grant.plane);
+                    let plane = overlay_candidates(&dev.card, crtc)
+                        .ok()
+                        .and_then(|candidates| {
+                            candidates
+                                .into_iter()
+                                .filter(|(plane, _)| Some(*plane) != taken)
+                                .max_by_key(|(_, zpos)| *zpos)
+                                .map(|(plane, _)| plane)
+                        });
+                    (plane, true)
+                }
+            };
+            let Some(plane) = plane else {
+                warn!(
+                    "card{}: no plane left for the cursor (no cursor plane, every overlay granted)",
+                    self.index
+                );
+                return;
+            };
+            if raised
+                && let ZposOutcome::CannotRaise { reason } =
+                    raise_plane_above_primary(&dev.card, plane)
+            {
+                warn!(
+                    "card{}: cursor plane {} may be HIDDEN behind the primary: {reason}",
+                    self.index,
+                    u32::from(plane),
+                );
+            }
+            info!(
+                "card{}: cursor bound to {} plane {} of crtc {}",
+                self.index,
+                if raised { "an overlay" } else { "the cursor" },
+                u32::from(plane),
+                u32::from(crtc)
+            );
+            *guard = Some(CursorSurface::new(plane, crtc));
+        }
+        let surface = guard.as_mut().expect("created above");
+        match surface.show_at(&dev.card, shape, position, mode) {
+            Ok(()) if first => info!(
+                "card{}: drawing the cursor at {position:?} (shape {shape:?}, mode {mode:?})",
+                self.index
+            ),
+            Ok(()) => debug!("card{}: cursor moved to {position:?}", self.index),
+            Err(e) => warn!(
                 "card{}: could not draw the cursor at {position:?}: {e}",
                 self.index
-            );
+            ),
         }
     }
 
@@ -916,6 +1012,22 @@ fn overlay_candidates(card: &DrmCard, crtc: crtc::Handle) -> io::Result<Vec<(pla
     }
 
     Ok(candidates)
+}
+
+/// The CRTC's own cursor plane, if the driver has one.
+///
+/// vc4 does — four of them, one per CRTC — and `lease_objects` keeps every
+/// cursor plane out of every lease, so this plane is always free for the
+/// pointer. Using it rather than an overlay costs a client nothing and needs no
+/// zpos: a cursor plane is above the primary by construction.
+fn cursor_plane(card: &DrmCard, crtc: crtc::Handle) -> Option<plane::Handle> {
+    let handles = card.resource_handles().ok()?;
+    card.plane_handles().ok()?.into_iter().find(|plane| {
+        plane_kind(card, *plane) == Some(PlaneKind::Cursor)
+            && card
+                .get_plane(*plane)
+                .is_ok_and(|info| handles.filter_crtcs(info.possible_crtcs()).contains(&crtc))
+    })
 }
 
 /// The card's primary plane, by its `type` property: never "the first plane

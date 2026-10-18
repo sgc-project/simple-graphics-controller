@@ -551,6 +551,14 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry) {
                 last_discovery = std::time::Instant::now();
                 for (path, device) in evdev::enumerate() {
                     if device.supported_relative_axes().iter().next().is_some() {
+                        // Non-blocking, and this is not an optimisation:
+                        // `fetch_events` reads until EAGAIN, so on a blocking fd
+                        // the read after the last queued event never returns —
+                        // the reader would sit in the kernel forever, having
+                        // handled one batch and drawn nothing.
+                        if !make_nonblocking(&device) {
+                            continue;
+                        }
                         // `or_insert`: a device already being read keeps its
                         // position in the queue; a new one starts here.
                         devices.entry(path).or_insert(device);
@@ -589,11 +597,23 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry) {
                 mode = card.pipeline_mode().or(mode);
             }
             let Some(mode) = mode else {
+                // No pipeline: forget what the cursor was drawn on, so the next
+                // one draws at once even if it uses the same mode.
+                if drawn_on.is_some() {
+                    tracing::debug!("no pipeline: the cursor has nowhere to be drawn");
+                }
+                drawn_on = None;
                 continue;
             };
             let fresh_pipeline = drawn_on != Some(mode);
             if !moved && !fresh_pipeline {
                 continue;
+            }
+            if fresh_pipeline {
+                // A new pipeline starts the pointer in the middle of its mode.
+                // A relative pointer has no absolute position to inherit, and a
+                // cursor parked in a corner on a fresh screen reads as broken.
+                pointer = pointer::Pointer::new(mode);
             }
             pointer.set_mode(mode);
             drawn_on = Some(mode);
@@ -609,6 +629,26 @@ pub(crate) fn spawn_pointer_tracking(drm: DrmRegistry) {
             }
         }
     });
+}
+
+/// Put an evdev device into non-blocking mode.
+///
+/// `evdev::Device` has no such method (only its `SyncStream` wrapper does), so
+/// this is the fcntl underneath. See the caller for why it is not optional.
+fn make_nonblocking(device: &evdev::Device) -> bool {
+    use std::os::fd::AsRawFd;
+
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+    let fd = device.as_raw_fd();
+    match fcntl(fd, FcntlArg::F_GETFL) {
+        Ok(flags) => fcntl(
+            fd,
+            FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+        )
+        .is_ok(),
+        Err(_) => false,
+    }
 }
 
 impl Inventory {

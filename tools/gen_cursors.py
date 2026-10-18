@@ -193,6 +193,26 @@ SHAPES = [
 
 # Hotspots for PNG-sourced shapes: the pixel in the icon that means "here".
 # A PNG has no such notion, so it is declared next to the shape name.
+# What each shape is for, in the words a downloader needs: the file to fetch and
+# the situation the cursor is meant to describe.
+MEANING = {
+    "default": "the ordinary arrow, used for everything without a better shape",
+    "text": "an I-beam over selectable text",
+    "pointer": "a hand over a link or button",
+    "crosshair": "precise picking, drawing and colour tasks",
+    "grab": "something can be grabbed and dragged",
+    "grabbing": "a drag is in progress",
+    "move": "the whole window or item can be moved",
+    "resize_vertical": "resize a top or bottom edge",
+    "resize_horizontal": "resize a left or right edge",
+    "resize_top_left": "resize from the top-left corner",
+    "resize_top_right": "resize from the top-right corner",
+    "wait": "busy, the application will not respond for a while",
+    "progress": "busy, but the application still responds",
+    "not_allowed": "this drop or action is not allowed here",
+    "help": "there is a tooltip or help for this",
+}
+
 HOTSPOTS = {
     # Read off the supplied 24px artwork: the arrow's tip, the I-beam's middle,
     # the hand's fingertip, the fist's centre.
@@ -320,10 +340,10 @@ def resample(rows, width, height, size):
     return out
 
 
-def render_icon(name, path, size, preview):
+def render_icon(name, path, size, preview, as_name=None, hotspot_from=None):
     width, height, rows = decode_png(path)
     rows = resample(rows, width, height, size)
-    const = _snake(name).upper()
+    const = _snake(as_name or name).upper()
 
     pixels = []
     painted = 0
@@ -339,7 +359,8 @@ def render_icon(name, path, size, preview):
             pixels.append(f"0x{a:02x}{pr:02x}{pg:02x}{pb:02x}")
 
     scale = size / max(1, max(width, height))
-    hx, hy = round(HOTSPOTS[name][0] * scale), round(HOTSPOTS[name][1] * scale)
+    hotspot_name = hotspot_from or name
+    hx, hy = round(HOTSPOTS[hotspot_name][0] * scale), round(HOTSPOTS[hotspot_name][1] * scale)
     if not (0 <= hx < size and 0 <= hy < size):
         raise SystemExit(f"{name}: hotspot {(hx, hy)} is outside {size}x{size}")
     if painted == 0:
@@ -521,8 +542,27 @@ def main():
         help="read PNGs named after the shapes from DIR instead of drawing them",
     )
     parser.add_argument("--preview", action="store_true")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="print the icon set the generator wants, one file per line, and exit",
+    )
     parser.add_argument("--out", required=False, help="where to write the art")
     args = parser.parse_args()
+
+    if args.list:
+        print(f"{len(SHAPES)} shapes, one PNG per shape, named after the shape,")
+        print("square, any size (they are resampled together), transparent background:")
+        print()
+        for name, _h, _o in SHAPES:
+            snake = _snake(name)
+            print(f"  {snake + '.png':<22} {MEANING.get(snake, '')}")
+        print()
+        print("Sizes are not fixed: the set is resampled to the largest icon's")
+        print("size, so supply them all at the same size (24 or 32 px read well).")
+        print("Hotspots are declared in HOTSPOTS above — the arrow's tip, the")
+        print("I-beam's middle — because a PNG does not carry one.")
+        return
 
     icons = pathlib.Path(args.icons) if args.icons else None
     if icons is not None and not icons.is_dir():
@@ -569,12 +609,30 @@ pub(crate) struct Art {{
 
 '''
 
-    body, from_icons, drawn = "", [], []
+    # A theme with a hole in it must not produce a cursor set in two styles: a
+    # missing shape falls back to the theme's own default icon, so every shape
+    # looks like the same family until its own artwork arrives. Only with no
+    # icons at all are the drawn vectors used.
+    default_icon = icons / "default.png" if icons is not None else None
+    body, from_icons, from_default, drawn = "", [], [], []
     for name, hotspot, ops in SHAPES:
         path = icons / f"{_snake(name)}.png" if icons is not None else None
         if path is not None and path.is_file():
             body += render_icon(_snake(name), path, args.size, args.preview) + "\n"
             from_icons.append(name)
+        elif default_icon is not None and default_icon.is_file():
+            body += (
+                render_icon(
+                    "default",
+                    default_icon,
+                    args.size,
+                    args.preview,
+                    as_name=_snake(name),
+                    hotspot_from="default",
+                )
+                + "\n"
+            )
+            from_default.append(name)
         else:
             body += render(name, hotspot, ops, args.size, args.preview) + "\n"
             drawn.append(name)
@@ -582,6 +640,7 @@ pub(crate) struct Art {{
 
     if icons is not None:
         print(f"icons: {', '.join(from_icons) or '(none)'}")
+        print(f"from default.png: {', '.join(from_default) or '(none)'}")
         print(f"drawn: {', '.join(drawn) or '(none)'}")
 
     out = pathlib.Path(args.out)

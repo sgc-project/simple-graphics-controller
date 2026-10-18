@@ -1,93 +1,121 @@
 //! The cursor surface: the plane the controller draws the pointer on.
 //!
-//! The controller owns the cursor, so it owns this: one surface per CRTC, an
-//! ARGB buffer holding the current shape, and a position taken from the
-//! controller's own pointer tracking. An application never touches it — it only
-//! names a shape.
+//! The controller owns the cursor, so it owns this: a sprite bound on an overlay
+//! plane of the pipeline's CRTC, positioned from the controller's own pointer
+//! tracking. An application never touches it — it only names a shape.
 //!
-//! vc4 (the Pi 5) has no atomic CURSOR plane; its cursor is reachable only
-//! through the legacy `set_cursor2`/`move_cursor` pair, which is what this uses.
-//! Boards with no cursor at all fall back to a reserved overlay (not yet
-//! implemented, and not needed on vc4).
+//! **Not `drmModeSetCursor2`.** vc4 (the Pi 5) has no atomic CURSOR plane, and
+//! its legacy cursor ioctls return success without putting anything on screen —
+//! measured, not assumed: the daemon drew, logged no error, and the panel stayed
+//! empty. The H618 has no cursor plane either. So the sprite goes on a regular
+//! overlay plane with its zpos raised above the primary and per-pixel alpha,
+//! which is what lean-display-server does for the same reason.
 
 use std::io;
 
-use drm::buffer::Buffer as _;
+use drm::buffer::{Buffer as _, DrmFourcc};
 use drm::control::dumbbuffer::DumbBuffer;
-use drm::control::{Device as _, crtc};
+use drm::control::{Device as _, crtc, framebuffer, plane};
 
 use simple_graphics_protocol::CursorShape;
 
 use super::drm::DrmCard;
 
-/// One card's cursor: the CRTC it is drawn on and the shape currently loaded.
+/// One card's cursor: an overlay plane holding the current shape.
 #[derive(Debug)]
 pub(crate) struct CursorSurface {
+    plane: plane::Handle,
     crtc: crtc::Handle,
-    /// The shape the loaded buffer holds, so a shape change is the only thing
+    /// The shape the loaded sprite holds, so a shape change is the only thing
     /// that re-uploads pixels.
     shape: Option<CursorShape>,
-    /// The buffer the kernel scans out as the cursor. Kept alive while
-    /// programmed: the plane holds a reference to it, and dropping it under the
-    /// kernel would leave a dangling framebuffer.
+    /// The buffer behind the framebuffer. Kept alive while the plane is bound:
+    /// dropping it would leave the kernel scanning out freed memory.
     buffer: Option<DumbBuffer>,
-    /// Whether the cursor is on screen right now.
+    fb: Option<framebuffer::Handle>,
+    /// Whether the sprite is on screen right now.
     visible: bool,
 }
 
 impl CursorSurface {
-    pub(crate) fn new(crtc: crtc::Handle) -> Self {
+    pub(crate) fn new(plane: plane::Handle, crtc: crtc::Handle) -> Self {
         Self {
+            plane,
             crtc,
             shape: None,
             buffer: None,
+            fb: None,
             visible: false,
         }
     }
 
-    /// Draw `shape` with its hotspot on `position` (the pointer), or just move
-    /// the cursor there if the shape is already loaded.
-    #[allow(deprecated)] // see the module note: vc4 has no cursor plane
+    pub(crate) fn plane(&self) -> plane::Handle {
+        self.plane
+    }
+
+    pub(crate) fn crtc(&self) -> crtc::Handle {
+        self.crtc
+    }
+
+    /// Draw `shape` with its hotspot on `position` (the pointer), clamped into
+    /// `mode`: an overlay neither wraps nor scales, so half a sprite would
+    /// simply not appear near an edge.
     pub(crate) fn show_at(
         &mut self,
         card: &DrmCard,
         shape: CursorShape,
         position: (i32, i32),
+        mode: (u32, u32),
     ) -> io::Result<()> {
-        if self.shape != Some(shape) || self.buffer.is_none() {
+        if self.shape != Some(shape) || self.fb.is_none() {
             self.load(card, shape)?;
         }
-        // The legacy cursor API separates the image from the position: the image
-        // (with its hotspot) is set once, the position moves on every event.
-        card.move_cursor(self.crtc, position)?;
+        let art = super::cursor_art(shape);
+        let (w, h) = (art.width, art.height);
+        // The sprite hangs off the pointer by its hotspot: the pixel the theme
+        // says is the point of the arrow sits where the pointer is.
+        let max_x = mode.0.saturating_sub(w) as i32;
+        let max_y = mode.1.saturating_sub(h) as i32;
+        let x = (position.0 - art.hotspot.0).clamp(0, max_x);
+        let y = (position.1 - art.hotspot.1).clamp(0, max_y);
+
+        let fb = self.fb.expect("loaded above");
+        card.set_plane(
+            self.plane,
+            self.crtc,
+            Some(fb),
+            0,
+            (x, y, w, h),
+            // Source rectangle in 16.16 fixed point: the whole sprite.
+            (0, 0, w << 16, h << 16),
+        )?;
         self.visible = true;
         Ok(())
     }
 
-    /// Take the cursor off screen. Kept idempotent: a hidden cursor is not
+    /// Take the sprite off the plane. Idempotent: a hidden cursor is not
     /// re-committed on every event.
-    #[allow(deprecated)] // see the module note: vc4 has no cursor plane
     pub(crate) fn hide(&mut self, card: &DrmCard) -> io::Result<()> {
         if self.visible {
-            card.set_cursor2(self.crtc, None::<&DumbBuffer>, (0, 0))?;
+            card.set_plane(self.plane, self.crtc, None, 0, (0, 0, 0, 0), (0, 0, 0, 0))?;
             self.visible = false;
         }
         Ok(())
     }
 
-    #[allow(deprecated)] // see the module note: vc4 has no cursor plane
     fn load(&mut self, card: &DrmCard, shape: CursorShape) -> io::Result<()> {
         let art = super::cursor_art(shape);
-        let mut buffer = card.create_dumb_buffer(
-            (art.width, art.height),
-            drm::buffer::DrmFourcc::Argb8888,
-            32,
-        )?;
+        // A new shape may be a different size (an icon-derived shape and a drawn
+        // fallback are not the same box), so the framebuffer is rebuilt.
+        if let Some(old) = self.fb.take() {
+            let _ = card.destroy_framebuffer(old);
+        }
+        let mut buffer =
+            card.create_dumb_buffer((art.width, art.height), DrmFourcc::Argb8888, 32)?;
         let pitch = buffer.pitch() as usize;
         {
             let mut mapping = card.map_dumb_buffer(&mut buffer)?;
             let dst = mapping.as_mut();
-            let row_bytes = art.width as usize * 4;
             for (y, row) in art.pixels.chunks(art.width as usize).enumerate() {
                 let offset = y * pitch;
                 for (x, pixel) in row.iter().enumerate() {
@@ -96,10 +124,14 @@ impl CursorSurface {
                     // on every aarch64/amd64 board we target.
                     dst[offset + x * 4..offset + x * 4 + 4].copy_from_slice(&pixel.to_le_bytes());
                 }
-                debug_assert_eq!(row.len() * 4, row_bytes);
             }
         }
-        card.set_cursor2(self.crtc, Some(&buffer), art.hotspot)?;
+        // Legacy addFB, and the depth is what selects the format: 24/bpp 32 is
+        // guessed as XRGB8888, which drops the alpha and paints the sprite's
+        // transparent pixels black. 32/32 gives ARGB8888, which is what a cursor
+        // needs. (A dumb buffer is linear by construction, so no modifier.)
+        let fb = card.add_framebuffer(&buffer, 32, 32)?;
+        self.fb = Some(fb);
         self.buffer = Some(buffer);
         self.shape = Some(shape);
         Ok(())
@@ -110,24 +142,26 @@ impl CursorSurface {
 mod tests {
     use super::*;
 
-    /// The one thing testable without a card: a fresh surface draws nothing and
-    /// knows it, so a caller's "hide" is a no-op rather than a commit.
     #[test]
-    fn a_fresh_surface_is_hidden() {
-        let surface =
-            CursorSurface::new(crtc::Handle::from(std::num::NonZeroU32::new(94).unwrap()));
+    fn a_fresh_surface_has_no_sprite() {
+        let surface = CursorSurface::new(
+            plane::Handle::from(std::num::NonZeroU32::new(107).unwrap()),
+            crtc::Handle::from(std::num::NonZeroU32::new(94).unwrap()),
+        );
         assert!(!surface.visible);
         assert!(surface.shape.is_none());
-        assert!(surface.buffer.is_none());
+        assert!(surface.fb.is_none());
+        assert_eq!(u32::from(surface.crtc()), 94);
     }
 
-    /// `show_at` must not re-upload pixels for a shape that is already loaded:
-    /// the buffer identity is what a caller relies on to avoid a commit per
-    /// event. Asserted through the state the loader sets.
+    /// A loaded shape is remembered, which is what stops `show_at` from
+    /// re-uploading pixels on every motion event.
     #[test]
     fn a_loaded_shape_is_remembered() {
-        let mut surface =
-            CursorSurface::new(crtc::Handle::from(std::num::NonZeroU32::new(94).unwrap()));
+        let mut surface = CursorSurface::new(
+            plane::Handle::from(std::num::NonZeroU32::new(107).unwrap()),
+            crtc::Handle::from(std::num::NonZeroU32::new(94).unwrap()),
+        );
         surface.shape = Some(CursorShape::Text);
         assert_eq!(surface.shape, Some(CursorShape::Text));
     }
